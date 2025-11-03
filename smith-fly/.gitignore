@@ -1,0 +1,20 @@
+# Environment configuration - contains sensitive data
+config/.env
+
+# Generated configuration files
+config/ls_config.yaml
+config/lp_config.yaml
+
+# Backup files
+*.bak
+
+# MacOS files
+.DS_Store
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
