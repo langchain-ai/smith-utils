@@ -513,11 +513,12 @@ install_langsmith() {
         log INFO "Installing LangSmith version: ${VERSION}"
     fi
     
-    # Set frontend service type to ClusterIP for nginx ingress
-    # (nginx uses Ingress resources, not LoadBalancer services)
-    if [ "$INGRESS_TYPE" = "nginx" ]; then
+    # Set frontend service type to ClusterIP when using Ingress resources
+    # Both ALB and nginx ingress controllers use Ingress resources, not LoadBalancer services
+    # The ingress controller handles external traffic routing, not the service directly
+    if [ "$INGRESS_TYPE" = "nginx" ] || [ "$INGRESS_TYPE" = "alb" ]; then
         helm_cmd+=" --set frontend.service.type=ClusterIP"
-        log INFO "Set frontend.service.type=ClusterIP for nginx ingress"
+        log INFO "Set frontend.service.type=ClusterIP for ${INGRESS_TYPE} ingress"
     fi
     
     # Add debug flag if enabled
@@ -551,11 +552,21 @@ get_ingress_hostname() {
     log INFO "Retrieving ingress hostname for LangSmith Deployment configuration..." >&2
     
     while [ $attempt -lt $max_attempts ]; do
+        # Try Ingress resource first (v12+ and ALB/nginx ingress configurations)
         # Try hostname first (AWS ELB), then IP (GKE, AKS, on-prem)
         endpoint=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
         
         if [ -z "$endpoint" ]; then
             endpoint=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+        fi
+        
+        # Fallback: Try LoadBalancer service (pre-v12 compatibility)
+        if [ -z "$endpoint" ]; then
+            endpoint=$(kubectl get svc langsmith-frontend -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        fi
+        
+        if [ -z "$endpoint" ]; then
+            endpoint=$(kubectl get svc langsmith-frontend -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
         fi
         
         if [ -n "$endpoint" ]; then
@@ -697,7 +708,7 @@ get_helm_release_info() {
     
     if [ -z "$helm_output" ] || [ "$helm_output" = "[]" ]; then
         echo "not_installed"
-        return 1
+        return 0
     fi
     
     # Parse JSON output for version and status
@@ -767,14 +778,15 @@ show_status() {
     local ls_info
     ls_info=$(get_helm_release_info "langsmith")
     
-    if [ "$ls_info" = "not_installed" ]; then
+    # Extract fields first to check if we have valid data
+    local ls_status ls_chart ls_app
+    ls_status=$(echo "$ls_info" | cut -d'|' -f1)
+    ls_chart=$(echo "$ls_info" | cut -d'|' -f2)
+    ls_app=$(echo "$ls_info" | cut -d'|' -f3)
+    
+    if [ -z "$ls_info" ] || [ "$ls_info" = "not_installed" ] || [ -z "$ls_status" ] || [ "$ls_status" = "not_installed" ]; then
         echo -e "  Status:   ${YELLOW}Not Installed${NC}"
     else
-        local ls_status ls_chart ls_app
-        ls_status=$(echo "$ls_info" | cut -d'|' -f1)
-        ls_chart=$(echo "$ls_info" | cut -d'|' -f2)
-        ls_app=$(echo "$ls_info" | cut -d'|' -f3)
-        
         if [ "$ls_status" = "deployed" ]; then
             echo -e "  Status:   ${GREEN}Installed${NC}"
         else
@@ -795,14 +807,15 @@ show_status() {
     local ld_info
     ld_info=$(get_helm_release_info "langsmith-deployment")
     
-    if [ "$ld_info" = "not_installed" ]; then
+    # Extract fields first to check if we have valid data
+    local ld_status ld_chart ld_app
+    ld_status=$(echo "$ld_info" | cut -d'|' -f1)
+    ld_chart=$(echo "$ld_info" | cut -d'|' -f2)
+    ld_app=$(echo "$ld_info" | cut -d'|' -f3)
+    
+    if [ -z "$ld_info" ] || [ "$ld_info" = "not_installed" ] || [ -z "$ld_status" ] || [ "$ld_status" = "not_installed" ]; then
         echo -e "  Status:   ${YELLOW}Not Installed${NC}"
     else
-        local ld_status ld_chart ld_app
-        ld_status=$(echo "$ld_info" | cut -d'|' -f1)
-        ld_chart=$(echo "$ld_info" | cut -d'|' -f2)
-        ld_app=$(echo "$ld_info" | cut -d'|' -f3)
-        
         if [ "$ld_status" = "deployed" ]; then
             echo -e "  Status:   ${GREEN}Installed${NC}"
         else
@@ -893,13 +906,24 @@ display_langsmith_info() {
     local endpoint=""
     local max_attempts=30
     local attempt=0
+    local endpoint_pending=false
     
     while [ $attempt -lt $max_attempts ]; do
+        # Try Ingress resource first (v12+ and ALB/nginx ingress configurations)
         # Try hostname first (AWS ELB), then IP (GKE, AKS, on-prem)
         endpoint=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
         
         if [ -z "$endpoint" ]; then
             endpoint=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+        fi
+        
+        # Fallback: Try LoadBalancer service (pre-v12 compatibility)
+        if [ -z "$endpoint" ]; then
+            endpoint=$(kubectl get svc langsmith-frontend -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        fi
+        
+        if [ -z "$endpoint" ]; then
+            endpoint=$(kubectl get svc langsmith-frontend -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
         fi
         
         if [ -n "$endpoint" ]; then
@@ -912,7 +936,8 @@ display_langsmith_info() {
     done
     
     if [ -z "$endpoint" ]; then
-        endpoint="<pending - run: kubectl get ingress -n ${NAMESPACE}>"
+        endpoint_pending=true
+        endpoint="YOUR_LANGSMITH_ENDPOINT"
     fi
     
     echo ""
@@ -923,15 +948,22 @@ display_langsmith_info() {
     echo -e "${BLUE}Connection Details:${NC}"
     echo "-------------------"
     echo -e "Namespace: ${GREEN}${NAMESPACE}${NC}"
-    echo -e "Endpoint:  ${GREEN}http://${endpoint}${NC}"
+    if [ "$endpoint_pending" = true ]; then
+        echo -e "Endpoint:  ${YELLOW}PENDING${NC}"
+        echo ""
+        echo -e "${YELLOW}⚠️  Endpoint is not ready yet. To retrieve it, run:${NC}"
+        echo -e "    ${GREEN}kubectl get ingress -n ${NAMESPACE}${NC}"
+        echo -e "    ${GREEN}kubectl get svc langsmith-frontend -n ${NAMESPACE}${NC}"
+    else
+        echo -e "Endpoint:  ${GREEN}http://${endpoint}${NC}"
+    fi
     echo -e "Email:     ${GREEN}${initialOrgAdminEmail}${NC}"
     echo -e "Password:  ${GREEN}${initialOrgAdminPassword}${NC}"
     echo ""
     echo -e "${YELLOW}⚠️  Important: Save these credentials securely!${NC}"
     echo ""
     echo -e "${RED}⚠️  WARNING: Resource Usage Alert${NC}"
-    echo -e "${RED}    Delete right after reproduction as amount of using resources per installation is high!${NC}"
-    echo -e "${RED}    CPU: ~20 cores, Memory: ~50Gi${NC}"
+    echo -e "${RED}    Delete right after reproduction if billable, as amount of using resources per installation is high!${NC}"
     echo ""
     echo "=========================================================================="
     echo -e "${BLUE}Example Python Usage:${NC}"
@@ -945,8 +977,12 @@ os.environ["LANGSMITH_API_KEY"] = "YOUR_KEY"
 os.environ["OPENAI_API_KEY"] = "YOUR_KEY"
 os.environ["LANGSMITH_PROJECT"] = "YOUR_PROJECT"
 EOF
+    if [ "$endpoint_pending" = true ]; then
+        echo ""
+        echo -e "${YELLOW}Note: Replace YOUR_LANGSMITH_ENDPOINT with the actual endpoint once available.${NC}"
+    fi
     echo ""
-    echo "" More details: https://docs.langchain.com/langsmith/self-host-usage
+    echo " More details: https://docs.langchain.com/langsmith/self-host-usage"
     echo ""
     echo "=========================================================================="
     echo ""

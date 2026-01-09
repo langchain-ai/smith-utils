@@ -26,6 +26,8 @@ backend:
         memory: 500Mi
 
 frontend:
+  service:
+    type: ClusterIP  # Use ClusterIP when using Ingress (ALB/nginx) controllers
   deployment:
     resources:
       requests:
