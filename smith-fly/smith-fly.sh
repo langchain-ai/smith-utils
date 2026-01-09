@@ -513,6 +513,13 @@ install_langsmith() {
         log INFO "Installing LangSmith version: ${VERSION}"
     fi
     
+    # Set frontend service type to ClusterIP for nginx ingress
+    # (nginx uses Ingress resources, not LoadBalancer services)
+    if [ "$INGRESS_TYPE" = "nginx" ]; then
+        helm_cmd+=" --set frontend.service.type=ClusterIP"
+        log INFO "Set frontend.service.type=ClusterIP for nginx ingress"
+    fi
+    
     # Add debug flag if enabled
     if [ "$DEBUG" = true ]; then
         helm_cmd+=" --debug"
