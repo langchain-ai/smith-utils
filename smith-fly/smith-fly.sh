@@ -30,6 +30,8 @@ INSTALL_LD=false
 VERSION=""
 DEBUG=false
 NAMESPACE=""
+INGRESS_TYPE="alb"  # Default to ALB, can be 'alb' or 'nginx'
+IS_V12_PLUS=true  # Default to true (latest version assumes v12+)
 initialOrgAdminEmail=""
 LicenseKey=""
 apiKeySalt=""
@@ -42,6 +44,18 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# Detect sed command (use gsed on macOS for GNU sed compatibility)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    if command -v gsed &> /dev/null; then
+        SED_CMD="gsed"
+    else
+        echo -e "${RED}[ERROR]${NC} GNU sed (gsed) is required on macOS. Install with: brew install gnu-sed"
+        exit 1
+    fi
+else
+    SED_CMD="sed"
+fi
 
 ##############################################################################
 # Function: log
@@ -85,6 +99,51 @@ cleanup_on_error() {
 trap cleanup_on_error ERR
 
 ##############################################################################
+# Function: is_version_v12_plus
+# Description: Checks if specified version is >= 0.12.0
+# Returns: 0 if version >= 0.12.0 or empty (latest), 1 otherwise
+##############################################################################
+is_version_v12_plus() {
+    local version="$1"
+    local major minor
+    
+    # Handle empty/latest case as v12+ (default to latest)
+    if [ -z "$version" ]; then
+        return 0
+    fi
+    
+    # Parse version string (e.g., "0.12.3" -> major=0, minor=12)
+    IFS='.' read -r major minor _ <<< "$version"
+    
+    # Handle non-numeric values gracefully
+    if ! [[ "$major" =~ ^[0-9]+$ ]] || ! [[ "$minor" =~ ^[0-9]+$ ]]; then
+        log WARNING "Unable to parse version '$version', assuming v12+"
+        return 0
+    fi
+    
+    # Check if version >= 0.12.0
+    if [ "$major" -gt 0 ] || [ "$minor" -ge 12 ]; then
+        return 0  # v12+
+    fi
+    
+    return 1  # pre-v12
+}
+
+##############################################################################
+# Function: detect_version
+# Description: Sets IS_V12_PLUS based on specified VERSION
+##############################################################################
+detect_version() {
+    if is_version_v12_plus "$VERSION"; then
+        IS_V12_PLUS=true
+        log INFO "Version detected as v12+ (new config format)"
+    else
+        IS_V12_PLUS=false
+        log INFO "Version detected as pre-v12 (legacy config format)"
+    fi
+}
+
+##############################################################################
 # Function: show_usage
 # Description: Displays script usage information
 ##############################################################################
@@ -95,19 +154,26 @@ Usage: $0 <up|down> [-l|-ld] [-v VERSION] [--debug]
 Actions:
     up      Spin up/install LangSmith or LangSmith Deployment
     down    Delete both LangSmith and LangSmith Deployment from your installation
+    status  Check installation status of LangSmith and LangSmith Deployment
 
 Options (for 'up' action):
     -l      Install LangSmith
     -ld     Install LangSmith Deployment
     -v      Specify version (optional)
+    -i      Ingress type: alb (default) or nginx
     --debug Enable Helm debug output (optional)
 
 Examples:
-    $0 up -l                     # Install LangSmith only
-    $0 up -l -v 1.2.3            # Install LangSmith with specific version
+    $0 up -l                     # Install LangSmith only (latest v12+ version, ALB ingress)
+    $0 up -l -i nginx            # Install LangSmith with nginx ingress
+    $0 up -l -v 0.12.3           # Install LangSmith v12+ with specific version
+    $0 up -l -v 0.11.5           # Install LangSmith pre-v12 with legacy config format
     $0 up -l --debug             # Install LangSmith with debug output
     $0 up -ld                    # Install LangSmith Deployment (automatically installs LangSmith if not present)
+    $0 up -ld -i nginx           # Install LangSmith Deployment with nginx ingress
+    $0 up -ld -v 0.11.0          # Install LangSmith Deployment with pre-v12 config format
     $0 down                      # Remove both LangSmith and LangSmith Deployment
+    $0 status                    # Check installation status of LangSmith and LangSmith Deployment
 
 Notes:
     - At least one of -l or -ld must be specified with "up"
@@ -115,6 +181,9 @@ Notes:
     - The "down" action removes both LangSmith and LangSmith Deployment
     - Configuration is read from ${ENV_FILE}
     - Namespace is auto-generated from your local machine hostname
+    - Version >= 0.12.0 uses new config format (config.deployment, config.hostname)
+    - Version < 0.12.0 uses legacy config format (config.langgraphPlatform, langgraphPlatformLicenseKey)
+    - Ingress type defaults to ALB (AWS). Use -i nginx for non-AWS Kubernetes clusters
 
 EOF
     exit 1
@@ -162,9 +231,9 @@ parse_arguments() {
         show_usage
     fi
     
-    # First argument should be action (up or down)
+    # First argument should be action (up, down, or status)
     case "$1" in
-        up|down)
+        up|down|status)
             ACTION="$1"
             shift
             ;;
@@ -200,6 +269,22 @@ parse_arguments() {
                 DEBUG=true
                 shift
                 ;;
+            -i)
+                if [ $# -lt 2 ]; then
+                    log ERROR "-i option requires an argument (alb or nginx)"
+                    show_usage
+                fi
+                case "$2" in
+                    alb|nginx)
+                        INGRESS_TYPE="$2"
+                        ;;
+                    *)
+                        log ERROR "Invalid ingress type: $2. Must be 'alb' or 'nginx'"
+                        show_usage
+                        ;;
+                esac
+                shift 2
+                ;;
             *)
                 log ERROR "Unknown option: $1"
                 show_usage
@@ -222,12 +307,19 @@ parse_arguments() {
         log INFO "Down action will remove both LangSmith and LangSmith Deployment"
     fi
     
-    log INFO "Action: ${ACTION}"
-    log INFO "Install LangSmith: ${INSTALL_LS}"
-    log INFO "Install LangSmith Deployment: ${INSTALL_LD}"
-    
-    if [ -n "$VERSION" ]; then
-        log INFO "Version: ${VERSION}"
+    # Skip verbose logging for status action
+    if [ "$ACTION" != "status" ]; then
+        log INFO "Action: ${ACTION}"
+        log INFO "Install LangSmith: ${INSTALL_LS}"
+        log INFO "Install LangSmith Deployment: ${INSTALL_LD}"
+        log INFO "Ingress Type: ${INGRESS_TYPE}"
+        
+        if [ -n "$VERSION" ]; then
+            log INFO "Version: ${VERSION}"
+        fi
+        
+        # Detect version format (v12+ or legacy)
+        detect_version
     fi
 }
 
@@ -351,7 +443,7 @@ create_langsmith_config() {
     escaped_password=$(printf '%s\n' "$initialOrgAdminPassword" | sed 's/[\/&]/\\&/g')
     
     # Use sed to replace values in the config file
-    sed -i.bak \
+    $SED_CMD -i.bak \
         -e "s/langsmithLicenseKey:.*/langsmithLicenseKey: \"${escaped_license}\"/" \
         -e "s/apiKeySalt:.*/apiKeySalt: \"${escaped_salt}\"/" \
         -e "s/initialOrgAdminEmail:.*/initialOrgAdminEmail: \"${escaped_email}\"/" \
@@ -359,14 +451,37 @@ create_langsmith_config() {
         -e "s/jwtSecret:.*/jwtSecret: \"${escaped_jwt}\"/" \
         "$LS_CONFIG_YAML"
     
-    # Add langgraphPlatformLicenseKey only if LangSmith Deployment is being installed
-    if [ "$INSTALL_LD" = true ]; then
+    # Handle ingress type configuration
+    if [ "$INGRESS_TYPE" = "nginx" ]; then
+        log INFO "Configuring nginx ingress..."
+        # Replace ALB ingress with nginx configuration
+        $SED_CMD -i.bak \
+            -e "s/ingressClassName: alb/ingressClassName: nginx/" \
+            -e "/alb.ingress.kubernetes.io/d" \
+            "$LS_CONFIG_YAML"
+        # Add empty annotations for nginx
+        $SED_CMD -i.bak \
+            -e "s/annotations:/annotations: {}/" \
+            "$LS_CONFIG_YAML"
+        rm -f "${LS_CONFIG_YAML}.bak"
+    else
+        log INFO "Using ALB ingress (default)..."
+    fi
+    
+    # Add langgraphPlatformLicenseKey only for pre-v12 when LangSmith Deployment is being installed
+    # As of v12, langgraphPlatformLicenseKey is deprecated and not needed
+    if [ "$INSTALL_LD" = true ] && [ "$IS_V12_PLUS" = false ]; then
+        log INFO "Adding langgraphPlatformLicenseKey for pre-v12 deployment"
         if ! grep -q "langgraphPlatformLicenseKey" "$LS_CONFIG_YAML"; then
-            sed -i.bak "/langsmithLicenseKey:/a\\
-  langgraphPlatformLicenseKey: \"${escaped_license}\"" "$LS_CONFIG_YAML"
+            # Use temp file for inserting after langsmithLicenseKey
+            local temp_insert=$(mktemp)
+            echo "  langgraphPlatformLicenseKey: \"${LicenseKey}\"" > "$temp_insert"
+            $SED_CMD -i.bak "/langsmithLicenseKey:/r $temp_insert" "$LS_CONFIG_YAML"
+            rm -f "$temp_insert"
         else
-            sed -i.bak "s/langgraphPlatformLicenseKey:.*/langgraphPlatformLicenseKey: \"${escaped_license}\"/" "$LS_CONFIG_YAML"
+            $SED_CMD -i.bak "s/langgraphPlatformLicenseKey:.*/langgraphPlatformLicenseKey: \"${escaped_license}\"/" "$LS_CONFIG_YAML"
         fi
+        rm -f "${LS_CONFIG_YAML}.bak"
     fi
     
     # Remove backup file
@@ -385,10 +500,10 @@ install_langsmith() {
     # Create configuration
     create_langsmith_config
     
-    # Build helm command
+    # Build helm command (quote paths to handle spaces in directory names)
     local helm_cmd="helm upgrade --install langsmith langchain/langsmith"
-    helm_cmd+=" --namespace ${NAMESPACE}"
-    helm_cmd+=" --values ${LS_CONFIG_YAML}"
+    helm_cmd+=" --namespace \"${NAMESPACE}\""
+    helm_cmd+=" --values \"${LS_CONFIG_YAML}\""
     helm_cmd+=" --wait --timeout 30m"
     helm_cmd+=" --hide-notes"
     
@@ -416,6 +531,42 @@ install_langsmith() {
 }
 
 ##############################################################################
+# Function: get_ingress_hostname
+# Description: Retrieves the ingress hostname/IP for LangSmith
+# Returns: Ingress endpoint (hostname or IP) via stdout
+# Note: Log messages are sent to stderr to avoid capturing them in $()
+##############################################################################
+get_ingress_hostname() {
+    local endpoint=""
+    local max_attempts=30
+    local attempt=0
+    
+    log INFO "Retrieving ingress hostname for LangSmith Deployment configuration..." >&2
+    
+    while [ $attempt -lt $max_attempts ]; do
+        # Try hostname first (AWS ELB), then IP (GKE, AKS, on-prem)
+        endpoint=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        
+        if [ -z "$endpoint" ]; then
+            endpoint=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+        fi
+        
+        if [ -n "$endpoint" ]; then
+            log SUCCESS "Found ingress endpoint: ${endpoint}" >&2
+            echo "$endpoint"
+            return 0
+        fi
+        
+        attempt=$((attempt + 1))
+        log INFO "Waiting for ingress endpoint... (attempt ${attempt}/${max_attempts})" >&2
+        sleep 10
+    done
+    
+    log WARNING "Could not retrieve ingress hostname after ${max_attempts} attempts" >&2
+    echo "<pending-ingress-hostname>"
+}
+
+##############################################################################
 # Function: create_langsmith_deployment_config
 # Description: Creates LangSmith Deployment configuration file
 ##############################################################################
@@ -432,34 +583,81 @@ create_langsmith_deployment_config() {
     
     # Escape special characters for sed
     escaped_license=$(printf '%s\n' "$LicenseKey" | sed 's/[\/&]/\\&/g')
+    escaped_namespace=$(printf '%s\n' "$NAMESPACE" | sed 's/[\/&]/\\&/g')
     
-    # Add LangSmith Deployment configuration under config section
-    # Check if config section exists
-    if ! grep -q "^config:" "$LD_CONFIG_YAML"; then
-        # Add config section with langgraphPlatform
-        cat >> "$LD_CONFIG_YAML" << EOF
+    if [ "$IS_V12_PLUS" = true ]; then
+        # v12+ configuration: use config.deployment instead of config.langgraphPlatform
+        log INFO "Generating v12+ LangSmith Deployment configuration"
+        
+        # Get ingress hostname for config.hostname
+        local ingress_hostname
+        ingress_hostname=$(get_ingress_hostname)
+        
+        # Add deployment.enabled under config section
+        if grep -q "^config:" "$LD_CONFIG_YAML"; then
+            # Add deployment section under config using temp file (robust approach)
+            local temp_insert=$(mktemp)
+            cat > "$temp_insert" << EOF
+  deployment:
+    enabled: true
+  hostname: "${ingress_hostname}"
+EOF
+            $SED_CMD -i.bak "/^config:/r $temp_insert" "$LD_CONFIG_YAML"
+            rm -f "$temp_insert" "${LD_CONFIG_YAML}.bak"
+        else
+            # Add config section with deployment
+            cat >> "$LD_CONFIG_YAML" << EOF
+
+config:
+  deployment:
+    enabled: true
+  hostname: "${ingress_hostname}"
+EOF
+        fi
+        
+        # Add operator section for v12+
+        if ! grep -q "^operator:" "$LD_CONFIG_YAML"; then
+            cat >> "$LD_CONFIG_YAML" << EOF
+
+operator:
+  createCRDs: false
+  watchNamespaces: "${NAMESPACE}"
+EOF
+        fi
+    else
+        # Pre-v12 configuration: use config.langgraphPlatform
+        log INFO "Generating pre-v12 LangSmith Deployment configuration"
+        
+        # Add LangSmith Deployment configuration under config section
+        if ! grep -q "^config:" "$LD_CONFIG_YAML"; then
+            # Add config section with langgraphPlatform
+            cat >> "$LD_CONFIG_YAML" << EOF
 
 config:
   langgraphPlatform:
     enabled: true
     langgraphPlatformLicenseKey: "${LicenseKey}"
 EOF
-    else
-        # Config section exists, check if langgraphPlatform exists
-        if ! grep -q "langgraphPlatform:" "$LD_CONFIG_YAML"; then
-            # Add langgraphPlatform under config section
-            sed -i.bak "/^config:/a\\
-  langgraphPlatform:\\
-    enabled: true\\
-    langgraphPlatformLicenseKey: \"${LicenseKey}\"" "$LD_CONFIG_YAML"
-            rm -f "${LD_CONFIG_YAML}.bak"
         else
-            # Update existing langgraphPlatform section
-            sed -i.bak \
-                -e "/langgraphPlatform:/,/enabled:/ s/enabled:.*/enabled: true/" \
-                -e "/langgraphPlatform:/,/langgraphPlatformLicenseKey:/ s/langgraphPlatformLicenseKey:.*/langgraphPlatformLicenseKey: \"${escaped_license}\"/" \
-                "$LD_CONFIG_YAML"
-            rm -f "${LD_CONFIG_YAML}.bak"
+            # Config section exists, check if langgraphPlatform exists
+            if ! grep -q "langgraphPlatform:" "$LD_CONFIG_YAML"; then
+                # Add langgraphPlatform under config section using temp file
+                local temp_insert=$(mktemp)
+                cat > "$temp_insert" << EOF
+  langgraphPlatform:
+    enabled: true
+    langgraphPlatformLicenseKey: "${LicenseKey}"
+EOF
+                $SED_CMD -i.bak "/^config:/r $temp_insert" "$LD_CONFIG_YAML"
+                rm -f "$temp_insert" "${LD_CONFIG_YAML}.bak"
+            else
+                # Update existing langgraphPlatform section
+                $SED_CMD -i.bak \
+                    -e "/langgraphPlatform:/,/enabled:/ s/enabled:.*/enabled: true/" \
+                    -e "/langgraphPlatform:/,/langgraphPlatformLicenseKey:/ s/langgraphPlatformLicenseKey:.*/langgraphPlatformLicenseKey: \"${escaped_license}\"/" \
+                    "$LD_CONFIG_YAML"
+                rm -f "${LD_CONFIG_YAML}.bak"
+            fi
         fi
     fi
     
@@ -476,6 +674,160 @@ check_langsmith_installed() {
     else
         return 1
     fi
+}
+
+##############################################################################
+# Function: get_helm_release_info
+# Description: Gets helm release information for a given release name
+# Arguments: $1 - release name (e.g., langsmith, langsmith-deployment)
+# Returns: version and status via global variables
+##############################################################################
+get_helm_release_info() {
+    local release_name="$1"
+    local helm_output
+    
+    helm_output=$(helm list -n "$NAMESPACE" --filter "^${release_name}$" -o json 2>/dev/null)
+    
+    if [ -z "$helm_output" ] || [ "$helm_output" = "[]" ]; then
+        echo "not_installed"
+        return 1
+    fi
+    
+    # Parse JSON output for version and status
+    local chart_version app_version status
+    chart_version=$(echo "$helm_output" | grep -o '"chart":"[^"]*"' | head -1 | cut -d'"' -f4)
+    app_version=$(echo "$helm_output" | grep -o '"app_version":"[^"]*"' | head -1 | cut -d'"' -f4)
+    status=$(echo "$helm_output" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+    
+    echo "${status}|${chart_version}|${app_version}"
+    return 0
+}
+
+##############################################################################
+# Function: get_pod_status_summary
+# Description: Gets pod status summary for a given label selector
+# Arguments: $1 - label selector (e.g., app.kubernetes.io/instance=langsmith)
+##############################################################################
+get_pod_status_summary() {
+    local label_selector="$1"
+    local total running pending failed
+    local pod_output
+    
+    # Get pod list once and reuse
+    pod_output=$(kubectl get pods -n "$NAMESPACE" -l "$label_selector" --no-headers 2>/dev/null || echo "")
+    
+    if [ -z "$pod_output" ]; then
+        echo "No pods found"
+        return
+    fi
+    
+    # Count pods by status (tr -d removes whitespace/newlines for clean integers)
+    total=$(echo "$pod_output" | wc -l | tr -d ' \n')
+    running=$(echo "$pod_output" | grep -c "Running" 2>/dev/null || true)
+    running=${running:-0}
+    pending=$(echo "$pod_output" | grep -c "Pending" 2>/dev/null || true)
+    pending=${pending:-0}
+    failed=$(echo "$pod_output" | grep -cE "(Failed|Error|CrashLoopBackOff)" 2>/dev/null || true)
+    failed=${failed:-0}
+    
+    # Build status string
+    local status_str="${running}/${total} Running"
+    if [ "$pending" -gt 0 ] 2>/dev/null; then
+        status_str+=", ${pending} Pending"
+    fi
+    if [ "$failed" -gt 0 ] 2>/dev/null; then
+        status_str+=", ${failed} Failed"
+    fi
+    
+    echo "$status_str"
+}
+
+##############################################################################
+# Function: show_status
+# Description: Displays installation status of LangSmith and LangSmith Deployment
+##############################################################################
+show_status() {
+    echo ""
+    echo "=========================================================================="
+    echo -e "${BLUE}LangSmith Installation Status${NC}"
+    echo "=========================================================================="
+    echo ""
+    echo -e "Namespace: ${GREEN}${NAMESPACE}${NC}"
+    echo ""
+    
+    # Check LangSmith status
+    echo -e "${BLUE}LangSmith:${NC}"
+    local ls_info
+    ls_info=$(get_helm_release_info "langsmith")
+    
+    if [ "$ls_info" = "not_installed" ]; then
+        echo -e "  Status:   ${YELLOW}Not Installed${NC}"
+    else
+        local ls_status ls_chart ls_app
+        ls_status=$(echo "$ls_info" | cut -d'|' -f1)
+        ls_chart=$(echo "$ls_info" | cut -d'|' -f2)
+        ls_app=$(echo "$ls_info" | cut -d'|' -f3)
+        
+        if [ "$ls_status" = "deployed" ]; then
+            echo -e "  Status:   ${GREEN}Installed${NC}"
+        else
+            echo -e "  Status:   ${YELLOW}${ls_status}${NC}"
+        fi
+        echo -e "  Chart:    ${ls_chart}"
+        [ -n "$ls_app" ] && echo -e "  Version:  ${ls_app}"
+        
+        # Get pod status
+        local pod_status
+        pod_status=$(get_pod_status_summary "app.kubernetes.io/instance=langsmith")
+        echo -e "  Pods:     ${pod_status}"
+    fi
+    echo ""
+    
+    # Check LangSmith Deployment status
+    echo -e "${BLUE}LangSmith Deployment:${NC}"
+    local ld_info
+    ld_info=$(get_helm_release_info "langsmith-deployment")
+    
+    if [ "$ld_info" = "not_installed" ]; then
+        echo -e "  Status:   ${YELLOW}Not Installed${NC}"
+    else
+        local ld_status ld_chart ld_app
+        ld_status=$(echo "$ld_info" | cut -d'|' -f1)
+        ld_chart=$(echo "$ld_info" | cut -d'|' -f2)
+        ld_app=$(echo "$ld_info" | cut -d'|' -f3)
+        
+        if [ "$ld_status" = "deployed" ]; then
+            echo -e "  Status:   ${GREEN}Installed${NC}"
+        else
+            echo -e "  Status:   ${YELLOW}${ld_status}${NC}"
+        fi
+        echo -e "  Chart:    ${ld_chart}"
+        [ -n "$ld_app" ] && echo -e "  Version:  ${ld_app}"
+        
+        # Get pod status
+        local pod_status
+        pod_status=$(get_pod_status_summary "app.kubernetes.io/instance=langsmith-deployment")
+        echo -e "  Pods:     ${pod_status}"
+    fi
+    echo ""
+    
+    # Check ingress endpoint
+    local endpoint=""
+    endpoint=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+    
+    if [ -z "$endpoint" ]; then
+        endpoint=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+    fi
+    
+    if [ -n "$endpoint" ]; then
+        echo -e "Ingress:   ${GREEN}http://${endpoint}${NC}"
+    else
+        echo -e "Ingress:   ${YELLOW}Not available${NC}"
+    fi
+    
+    echo ""
+    echo "=========================================================================="
+    echo ""
 }
 
 ##############################################################################
@@ -496,10 +848,10 @@ install_langsmith_deployment() {
     # Create LangSmith Deployment configuration
     create_langsmith_deployment_config
     
-    # Build helm command
+    # Build helm command (quote paths to handle spaces in directory names)
     local helm_cmd="helm upgrade --install langsmith-deployment langchain/langgraph-cloud"
-    helm_cmd+=" --namespace ${NAMESPACE}"
-    helm_cmd+=" --values ${LD_CONFIG_YAML}"
+    helm_cmd+=" --namespace \"${NAMESPACE}\""
+    helm_cmd+=" --values \"${LD_CONFIG_YAML}\""
     helm_cmd+=" --wait --timeout 30m"
     
     # Add version if specified
@@ -643,19 +995,27 @@ uninstall_all() {
 # Main execution
 ##############################################################################
 main() {
-    log INFO "Starting LangSmith/LangSmith Deployment Installation Script"
-    
     # Parse command line arguments
     parse_arguments "$@"
+    
+    # For status action, only set namespace and show status (minimal output)
+    if [ "$ACTION" = "status" ]; then
+        # Generate namespace from hostname (silent)
+        NAMESPACE=$(hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+        show_status
+        return 0
+    fi
+    
+    log INFO "Starting LangSmith/LangSmith Deployment Installation Script"
     
     # Check prerequisites
     check_prerequisites
     
-    # Load configuration
-    load_configuration
-    
     # Setup namespace
     setup_namespace
+    
+    # Load configuration
+    load_configuration
     
     # Setup Helm repository
     setup_helm_repo

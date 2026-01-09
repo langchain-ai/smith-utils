@@ -9,6 +9,7 @@ config:
     initialOrgAdminPassword: ""
     jwtSecret: ""
 
+
 ingress:
   enabled: true
   ingressClassName: alb
@@ -16,14 +17,64 @@ ingress:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
 
-postgresql:
-  enabled: true
-  primary:
-    persistence:
-      enabled: false
+
+backend:
+  deployment:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+
+frontend:
+  deployment:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+
+platformBackend:
+  deployment:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+
+playground:
+  deployment:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+
+queue:
+  replicas: 1
+  deployment:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+
+postgres:
+  persistence:
+    enabled: false
+  statefulSet:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 500Mi
 
 redis:
-  enabled: true
-  master:
-    persistence:
-      enabled: false
+  persistence:
+    enabled: false
+  statefulSet:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 500Mi
+
+clickhouse:
+  statefulSet:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 500Mi

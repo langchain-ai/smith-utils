@@ -13,6 +13,7 @@ Key capabilities:
 - Helm chart installation and upgrades
 - Namespace management
 - Credential management
+- Installation status checking
 - Clean uninstallation for resource cleanup
 
 ## Requirements
@@ -28,7 +29,9 @@ Key capabilities:
 - A running Kubernetes cluster with:
   - **CPU**: ~20 cores available
   - **Memory**: ~50Gi available
-  - Ingress controller configured (e.g., nginx-ingress, traefik)
+  - Ingress controller configured:
+    - **AWS**: ALB Ingress Controller (default)
+    - **Non-AWS**: nginx-ingress controller (use `-i nginx` flag)
   - StorageClass for persistent volumes
 
 ### Configuration Files
@@ -65,8 +68,14 @@ config:
 ### Basic Commands
 
 ```bash
-# Install LangSmith only
+# Check installation status
+./smith-fly.sh status
+
+# Install LangSmith only (uses ALB ingress by default)
 ./smith-fly.sh up -l
+
+# Install LangSmith with nginx ingress (for non-AWS clusters)
+./smith-fly.sh up -l -i nginx
 
 # Install LangSmith with specific version
 ./smith-fly.sh up -l -v 1.2.3
@@ -77,6 +86,9 @@ config:
 # Install LangSmith Deployment (auto-installs LangSmith if needed)
 ./smith-fly.sh up -ld
 
+# Install LangSmith Deployment with nginx ingress
+./smith-fly.sh up -ld -i nginx
+
 # Uninstall everything
 ./smith-fly.sh down
 ```
@@ -84,17 +96,42 @@ config:
 ### Command Options
 
 ```
-Usage: ./smith-fly.sh <up|down> [-l|-ld] [-v VERSION] [--debug]
+Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [--debug]
 
 Actions:
     up      Spin up/install LangSmith or LangSmith Deployment
     down    Delete both LangSmith and LangSmith Deployment
+    status  Check installation status of LangSmith and LangSmith Deployment
 
-Options:
+Options (for 'up' action):
     -l      Install LangSmith
     -ld     Install LangSmith Deployment
     -v      Specify version (optional)
+    -i      Ingress type: alb (default) or nginx
     --debug Enable Helm debug output (optional)
+```
+
+### Status Output Example
+
+```
+==========================================================================
+LangSmith Installation Status
+==========================================================================
+
+Namespace: my-hostname
+
+LangSmith:
+  Status:   Installed
+  Chart:    langsmith-0.12.34
+  Version:  0.12.73
+  Pods:     14/14 Running
+
+LangSmith Deployment:
+  Status:   Not Installed
+
+Ingress:   http://192.168.49.2
+
+==========================================================================
 ```
 
 ### Configuration Setup
@@ -182,10 +219,17 @@ kubectl top pods -n <namespace>
 
 ```bash
 # Verify ingress controller is running
-kubectl get pods -n ingress-nginx  # or your ingress namespace
+# For nginx ingress:
+kubectl get pods -n ingress-nginx
 
-# Check ingress class
+# For AWS ALB ingress:
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+
+# Check available ingress classes
 kubectl get ingressclass
+
+# Verify ingress resource
+kubectl get ingress -n <namespace> -o yaml
 ```
 
 #### Database Connection Issues
@@ -242,6 +286,31 @@ kubectl delete namespace $NAMESPACE
 - On-premise Kubernetes
 - Any Kubernetes distribution (k3s, microk8s, etc.)
 
+### Ingress Configuration
+
+The script supports two ingress types:
+
+| Ingress Type | Flag | Use Case |
+|--------------|------|----------|
+| **ALB** (default) | `-i alb` or omit | AWS EKS with ALB Ingress Controller |
+| **nginx** | `-i nginx` | GKE, AKS, on-premise, k3s, minikube, etc. |
+
+**ALB Ingress (Default):**
+```yaml
+ingress:
+  ingressClassName: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+```
+
+**nginx Ingress:**
+```yaml
+ingress:
+  ingressClassName: nginx
+  annotations: {}
+```
+
 The script automatically detects ingress endpoints using both hostname (AWS) and IP (GKE, AKS, on-prem) formats.
 
 ## Security Notes
@@ -281,7 +350,8 @@ smith-fly/
 
 - [ ] Support TLS/SSL for ingress
 - [ ] Support custom namespace names
-- [ ] Add health check automation
+- [x] Add installation status check (`status` action)
+- [x] Support multiple ingress types (ALB/nginx via `-i` flag)
 - [ ] Support external database configuration
 - [ ] Add metrics collection integration
 - [ ] Support air-gapped installations
