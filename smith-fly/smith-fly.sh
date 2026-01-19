@@ -590,6 +590,13 @@ install_langsmith() {
         log INFO "Set frontend.service.type=ClusterIP for ${INGRESS_TYPE} ingress"
     fi
     
+    # Check if CRDs already exist (shared cluster scenario)
+    # Skip CRD creation to avoid ownership conflicts with other releases
+    if kubectl get crd lgps.apps.langchain.ai &> /dev/null; then
+        log INFO "CRD lgps.apps.langchain.ai already exists, skipping CRD creation"
+        helm_cmd+=" --set operator.createCRDs=false"
+    fi
+    
     # Set replica count for all components if specified
     if [ -n "$REPLICA_COUNT" ]; then
         helm_cmd+=" --set backend.deployment.replicas=${REPLICA_COUNT}"
@@ -1038,6 +1045,10 @@ EOF
         helm_cmd+=" --values \"${LS_CONFIG_YAML}\""
         helm_cmd+=" --wait --timeout 30m"
         helm_cmd+=" --hide-notes"
+        
+        # Skip CRD creation on upgrade - CRDs are cluster-scoped and may be owned by another release
+        # This prevents "invalid ownership metadata" errors in shared clusters
+        helm_cmd+=" --set operator.createCRDs=false"
         
         if [ "$INGRESS_TYPE" = "nginx" ] || [ "$INGRESS_TYPE" = "alb" ]; then
             helm_cmd+=" --set frontend.service.type=ClusterIP"
