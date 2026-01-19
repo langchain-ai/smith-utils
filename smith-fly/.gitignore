@@ -4,9 +4,9 @@ config/.env
 # Helm
 helm
 
-# Generated configuration files
+# Generated configuration files (contain sensitive data)
 config/ls_config.yaml
-config/lp_config.yaml
+config/ld_config.yaml
 
 # Backup files
 *.bak

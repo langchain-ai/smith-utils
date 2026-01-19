@@ -699,11 +699,12 @@ EOF
     fi
     
     # Add LangGraph Cloud license key (uses same license as LangSmith)
+    # Reference: https://github.com/langchain-ai/helm/blob/main/charts/langgraph-cloud/values.yaml
     log INFO "Adding LangGraph Cloud license key configuration"
     escaped_license=$(printf '%s\n' "$LicenseKey" | sed 's/[\/&]/\\&/g')
     if grep -q "^config:" "$LD_CONFIG_YAML"; then
-        # Add langgraphCloudLicenseKey under config section
-        $SED_CMD -i.bak "/^config:/a\\  langgraphCloudLicenseKey: \"${escaped_license}\"" "$LD_CONFIG_YAML"
+        # Add langGraphCloudLicenseKey under config section (note: capital G in Graph per official chart)
+        $SED_CMD -i.bak "/^config:/a\\  langGraphCloudLicenseKey: \"${escaped_license}\"" "$LD_CONFIG_YAML"
         rm -f "${LD_CONFIG_YAML}.bak"
     fi
     
