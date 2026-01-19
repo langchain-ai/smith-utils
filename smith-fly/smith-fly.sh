@@ -436,6 +436,47 @@ generate_secrets() {
 }
 
 ##############################################################################
+# Function: load_existing_secrets
+# Description: Loads existing secrets from ls_config.yaml if it exists
+# Returns: 0 if secrets were loaded, 1 if not found or invalid
+##############################################################################
+load_existing_secrets() {
+    if [ ! -f "$LS_CONFIG_YAML" ]; then
+        log INFO "No existing LangSmith config found, will generate new secrets"
+        return 1
+    fi
+    
+    log INFO "Found existing LangSmith config, loading secrets..."
+    
+    # Extract existing secrets from ls_config.yaml using grep and sed
+    # IMPORTANT: Use --color=never to prevent ANSI escape codes from corrupting values
+    local existing_salt existing_jwt existing_password
+    
+    existing_salt=$(grep --color=never -E '^\s*apiKeySalt:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*apiKeySalt:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
+    existing_jwt=$(grep --color=never -E '^\s*jwtSecret:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*jwtSecret:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
+    existing_password=$(grep --color=never -E '^\s*initialOrgAdminPassword:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*initialOrgAdminPassword:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
+    
+    # Validate that all secrets exist and don't contain ANSI escape codes
+    # Check for control characters that indicate corrupted values
+    if [ -n "$existing_salt" ] && [ -n "$existing_jwt" ] && [ -n "$existing_password" ]; then
+        # Verify no ANSI escape sequences (control characters) are present
+        if echo "$existing_salt$existing_jwt$existing_password" | grep -q $'\x1b'; then
+            log WARNING "Existing secrets contain control characters, will generate new ones"
+            return 1
+        fi
+        
+        apiKeySalt="$existing_salt"
+        jwtSecret="$existing_jwt"
+        initialOrgAdminPassword="$existing_password"
+        log SUCCESS "Loaded existing secrets from ${LS_CONFIG_YAML}"
+        return 0
+    fi
+    
+    log WARNING "Existing config missing some secrets, will generate new ones"
+    return 1
+}
+
+##############################################################################
 # Function: create_langsmith_config
 # Description: Creates LangSmith configuration file with substituted values
 ##############################################################################
@@ -447,12 +488,20 @@ create_langsmith_config() {
         exit 1
     fi
     
+    # Try to load existing secrets from ls_config.yaml before overwriting
+    # This preserves secrets across deployments (e.g., when adding LangGraph on top of LangSmith)
+    if [ -z "$apiKeySalt" ] || [ -z "$jwtSecret" ] || [ -z "$initialOrgAdminPassword" ]; then
+        load_existing_secrets || true
+    fi
+    
     # Copy base config to LangSmith config
     cp "$CONFIG_YAML" "$LS_CONFIG_YAML"
     
-    # Generate secrets if not already generated
+    # Generate secrets only if not already loaded from existing config
     if [ -z "$apiKeySalt" ] || [ -z "$jwtSecret" ] || [ -z "$initialOrgAdminPassword" ]; then
         generate_secrets
+    else
+        log INFO "Using existing secrets (preserved from previous deployment)"
     fi
     
     # Escape special characters for sed
