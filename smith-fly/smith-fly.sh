@@ -32,6 +32,7 @@ DEBUG=false
 NAMESPACE=""
 INGRESS_TYPE="alb"  # Default to ALB, can be 'alb' or 'nginx'
 IS_V12_PLUS=true  # Default to true (latest version assumes v12+)
+REPLICA_COUNT=""  # Optional replica count override
 initialOrgAdminEmail=""
 LicenseKey=""
 apiKeySalt=""
@@ -161,6 +162,7 @@ Options (for 'up' action):
     -ld     Install LangSmith Deployment
     -v      Specify version (optional)
     -i      Ingress type: alb (default) or nginx
+    -r      Specify replica count for all components (optional, -r 1 also reduces resource requests)
     --debug Enable Helm debug output (optional)
 
 Examples:
@@ -168,10 +170,12 @@ Examples:
     $0 up -l -i nginx            # Install LangSmith with nginx ingress
     $0 up -l -v 0.12.3           # Install LangSmith v12+ with specific version
     $0 up -l -v 0.11.5           # Install LangSmith pre-v12 with legacy config format
+    $0 up -l -r 1                # Install LangSmith with 1 replica per component
     $0 up -l --debug             # Install LangSmith with debug output
     $0 up -ld                    # Install LangSmith Deployment (automatically installs LangSmith if not present)
     $0 up -ld -i nginx           # Install LangSmith Deployment with nginx ingress
     $0 up -ld -v 0.11.0          # Install LangSmith Deployment with pre-v12 config format
+    $0 up -ld -r 1               # Install LangSmith Deployment with 1 replica per component
     $0 down                      # Remove both LangSmith and LangSmith Deployment
     $0 status                    # Check installation status of LangSmith and LangSmith Deployment
 
@@ -285,6 +289,18 @@ parse_arguments() {
                 esac
                 shift 2
                 ;;
+            -r|--replicas)
+                if [ $# -lt 2 ]; then
+                    log ERROR "-r option requires a replica count argument"
+                    show_usage
+                fi
+                if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                    log ERROR "Replica count must be a positive integer"
+                    show_usage
+                fi
+                REPLICA_COUNT="$2"
+                shift 2
+                ;;
             *)
                 log ERROR "Unknown option: $1"
                 show_usage
@@ -316,6 +332,10 @@ parse_arguments() {
         
         if [ -n "$VERSION" ]; then
             log INFO "Version: ${VERSION}"
+        fi
+        
+        if [ -n "$REPLICA_COUNT" ]; then
+            log INFO "Replica Count: ${REPLICA_COUNT}"
         fi
         
         # Detect version format (v12+ or legacy)
@@ -519,6 +539,52 @@ install_langsmith() {
     if [ "$INGRESS_TYPE" = "nginx" ] || [ "$INGRESS_TYPE" = "alb" ]; then
         helm_cmd+=" --set frontend.service.type=ClusterIP"
         log INFO "Set frontend.service.type=ClusterIP for ${INGRESS_TYPE} ingress"
+    fi
+    
+    # Set replica count for all components if specified
+    if [ -n "$REPLICA_COUNT" ]; then
+        helm_cmd+=" --set backend.deployment.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set frontend.deployment.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set platformBackend.deployment.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set playground.deployment.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set queue.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set ingestQueue.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set aceBackend.deployment.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set hostBackend.deployment.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set listener.deployment.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set operator.deployment.replicas=${REPLICA_COUNT}"
+        log INFO "Setting replica count to ${REPLICA_COUNT} for all components"
+        
+        # When using minimal replicas, also reduce resource requests to fit in constrained environments
+        if [ "$REPLICA_COUNT" -eq 1 ]; then
+            log INFO "Applying minimal resource requests for single-replica deployment"
+            helm_cmd+=" --set backend.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set backend.deployment.resources.requests.memory=256Mi"
+            helm_cmd+=" --set frontend.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set frontend.deployment.resources.requests.memory=256Mi"
+            helm_cmd+=" --set platformBackend.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set platformBackend.deployment.resources.requests.memory=256Mi"
+            helm_cmd+=" --set playground.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set playground.deployment.resources.requests.memory=256Mi"
+            helm_cmd+=" --set queue.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set queue.deployment.resources.requests.memory=128Mi"
+            helm_cmd+=" --set ingestQueue.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set ingestQueue.deployment.resources.requests.memory=128Mi"
+            helm_cmd+=" --set aceBackend.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set aceBackend.deployment.resources.requests.memory=256Mi"
+            helm_cmd+=" --set hostBackend.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set hostBackend.deployment.resources.requests.memory=256Mi"
+            helm_cmd+=" --set listener.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set listener.deployment.resources.requests.memory=128Mi"
+            helm_cmd+=" --set operator.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set operator.deployment.resources.requests.memory=128Mi"
+            helm_cmd+=" --set postgres.statefulSet.resources.requests.cpu=50m"
+            helm_cmd+=" --set postgres.statefulSet.resources.requests.memory=128Mi"
+            helm_cmd+=" --set redis.statefulSet.resources.requests.cpu=50m"
+            helm_cmd+=" --set redis.statefulSet.resources.requests.memory=128Mi"
+            helm_cmd+=" --set clickhouse.statefulSet.resources.requests.cpu=100m"
+            helm_cmd+=" --set clickhouse.statefulSet.resources.requests.memory=256Mi"
+        fi
     fi
     
     # Add debug flag if enabled
@@ -928,6 +994,50 @@ EOF
             helm_cmd+=" --set frontend.service.type=ClusterIP"
         fi
         
+        # Set replica count for all components if specified
+        if [ -n "$REPLICA_COUNT" ]; then
+            helm_cmd+=" --set backend.deployment.replicas=${REPLICA_COUNT}"
+            helm_cmd+=" --set frontend.deployment.replicas=${REPLICA_COUNT}"
+            helm_cmd+=" --set platformBackend.deployment.replicas=${REPLICA_COUNT}"
+            helm_cmd+=" --set playground.deployment.replicas=${REPLICA_COUNT}"
+            helm_cmd+=" --set queue.replicas=${REPLICA_COUNT}"
+            helm_cmd+=" --set ingestQueue.replicas=${REPLICA_COUNT}"
+            helm_cmd+=" --set aceBackend.deployment.replicas=${REPLICA_COUNT}"
+            helm_cmd+=" --set hostBackend.deployment.replicas=${REPLICA_COUNT}"
+            helm_cmd+=" --set listener.deployment.replicas=${REPLICA_COUNT}"
+            helm_cmd+=" --set operator.deployment.replicas=${REPLICA_COUNT}"
+            
+            # When using minimal replicas, also reduce resource requests
+            if [ "$REPLICA_COUNT" -eq 1 ]; then
+                helm_cmd+=" --set backend.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set backend.deployment.resources.requests.memory=256Mi"
+                helm_cmd+=" --set frontend.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set frontend.deployment.resources.requests.memory=256Mi"
+                helm_cmd+=" --set platformBackend.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set platformBackend.deployment.resources.requests.memory=256Mi"
+                helm_cmd+=" --set playground.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set playground.deployment.resources.requests.memory=256Mi"
+                helm_cmd+=" --set queue.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set queue.deployment.resources.requests.memory=128Mi"
+                helm_cmd+=" --set ingestQueue.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set ingestQueue.deployment.resources.requests.memory=128Mi"
+                helm_cmd+=" --set aceBackend.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set aceBackend.deployment.resources.requests.memory=256Mi"
+                helm_cmd+=" --set hostBackend.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set hostBackend.deployment.resources.requests.memory=256Mi"
+                helm_cmd+=" --set listener.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set listener.deployment.resources.requests.memory=128Mi"
+                helm_cmd+=" --set operator.deployment.resources.requests.cpu=50m"
+                helm_cmd+=" --set operator.deployment.resources.requests.memory=128Mi"
+                helm_cmd+=" --set postgres.statefulSet.resources.requests.cpu=50m"
+                helm_cmd+=" --set postgres.statefulSet.resources.requests.memory=128Mi"
+                helm_cmd+=" --set redis.statefulSet.resources.requests.cpu=50m"
+                helm_cmd+=" --set redis.statefulSet.resources.requests.memory=128Mi"
+                helm_cmd+=" --set clickhouse.statefulSet.resources.requests.cpu=100m"
+                helm_cmd+=" --set clickhouse.statefulSet.resources.requests.memory=256Mi"
+            fi
+        fi
+        
         if [ "$DEBUG" = true ]; then
             helm_cmd+=" --debug"
         fi
@@ -958,6 +1068,21 @@ EOF
     if [ -n "$VERSION" ]; then
         helm_cmd+=" --version ${VERSION}"
         log INFO "Installing LangSmith Deployment version: ${VERSION}"
+    fi
+    
+    # Set replica count for LangGraph Cloud components if specified
+    if [ -n "$REPLICA_COUNT" ]; then
+        helm_cmd+=" --set apiServer.deployment.replicas=${REPLICA_COUNT}"
+        helm_cmd+=" --set studio.deployment.replicas=${REPLICA_COUNT}"
+        log INFO "Setting replica count to ${REPLICA_COUNT} for LangGraph Cloud components"
+        
+        # When using minimal replicas, also reduce resource requests
+        if [ "$REPLICA_COUNT" -eq 1 ]; then
+            helm_cmd+=" --set apiServer.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set apiServer.deployment.resources.requests.memory=256Mi"
+            helm_cmd+=" --set studio.deployment.resources.requests.cpu=50m"
+            helm_cmd+=" --set studio.deployment.resources.requests.memory=256Mi"
+        fi
     fi
     
     # Add debug flag if enabled
