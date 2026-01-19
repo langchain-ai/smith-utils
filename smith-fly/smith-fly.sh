@@ -604,34 +604,10 @@ create_langsmith_deployment_config() {
     escaped_namespace=$(printf '%s\n' "$NAMESPACE" | sed 's/[\/&]/\\&/g')
     
     if [ "$IS_V12_PLUS" = true ]; then
-        # v12+ configuration: use config.deployment instead of config.langgraphPlatform
-        log INFO "Generating v12+ LangSmith Deployment configuration"
-        
-        # Get ingress hostname for config.hostname
-        local ingress_hostname
-        ingress_hostname=$(get_ingress_hostname)
-        
-        # Add deployment.enabled under config section
-        if grep -q "^config:" "$LD_CONFIG_YAML"; then
-            # Add deployment section under config using temp file (robust approach)
-            local temp_insert=$(mktemp)
-            cat > "$temp_insert" << EOF
-  deployment:
-    enabled: true
-  hostname: "${ingress_hostname}"
-EOF
-            $SED_CMD -i.bak "/^config:/r $temp_insert" "$LD_CONFIG_YAML"
-            rm -f "$temp_insert" "${LD_CONFIG_YAML}.bak"
-        else
-            # Add config section with deployment
-            cat >> "$LD_CONFIG_YAML" << EOF
-
-config:
-  deployment:
-    enabled: true
-  hostname: "${ingress_hostname}"
-EOF
-        fi
+        # v12+ configuration for langgraph-cloud chart
+        # NOTE: config.deployment.enabled is for LangSmith chart, NOT langgraph-cloud chart
+        # The langgraph-cloud chart uses: config.langGraphCloudLicenseKey, apiServer, studio, etc.
+        log INFO "Generating v12+ LangSmith Deployment configuration (langgraph-cloud chart)"
         
         # Add operator section for v12+
         if ! grep -q "^operator:" "$LD_CONFIG_YAML"; then
@@ -904,12 +880,69 @@ show_status() {
 install_langsmith_deployment() {
     log INFO "Installing LangSmith Deployment..."
     
-    # Check if LangSmith is installed
-    if ! check_langsmith_installed; then
-        log WARNING "LangSmith is not installed. Installing LangSmith first..."
-        install_langsmith
+    # For v12+, LangSmith needs config.deployment.enabled=true to show Deployments UI
+    # This must be set in the LangSmith chart, not the langgraph-cloud chart
+    if [ "$IS_V12_PLUS" = true ]; then
+        log INFO "Enabling deployment feature in LangSmith (v12+)..."
+        
+        # Get ingress hostname
+        local ingress_hostname
+        ingress_hostname=$(get_ingress_hostname 2>/dev/null || echo "")
+        if [ -z "$ingress_hostname" ] || [ "$ingress_hostname" = "<pending-ingress-hostname>" ]; then
+            # Fallback to Minikube IP if ingress not ready yet
+            ingress_hostname="192.168.49.2"
+        fi
+        
+        # For nginx ingress, if hostname is an IP address, use nip.io for DNS resolution
+        # Kubernetes Ingress requires a DNS name, not an IP address
+        if [ "$INGRESS_TYPE" = "nginx" ]; then
+            if [[ "$ingress_hostname" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                log INFO "Converting IP address to nip.io DNS name for nginx ingress"
+                ingress_hostname="${ingress_hostname}.nip.io"
+            fi
+        fi
+        
+        # Create/update LangSmith config with deployment enabled
+        create_langsmith_config
+        
+        # Add deployment section to ls_config.yaml for LangSmith chart
+        log INFO "Adding config.deployment.enabled and config.hostname to LangSmith config"
+        local temp_insert=$(mktemp)
+        cat > "$temp_insert" << EOF
+  deployment:
+    enabled: true
+  hostname: "${ingress_hostname}"
+EOF
+        $SED_CMD -i.bak "/^config:/r $temp_insert" "$LS_CONFIG_YAML"
+        rm -f "$temp_insert" "${LS_CONFIG_YAML}.bak"
+        
+        # Always upgrade LangSmith to ensure deployment is enabled
+        log INFO "Upgrading LangSmith with deployment feature enabled..."
+        local helm_cmd="helm upgrade --install langsmith langchain/langsmith"
+        helm_cmd+=" --namespace \"${NAMESPACE}\""
+        helm_cmd+=" --values \"${LS_CONFIG_YAML}\""
+        helm_cmd+=" --wait --timeout 30m"
+        helm_cmd+=" --hide-notes"
+        
+        if [ "$INGRESS_TYPE" = "nginx" ] || [ "$INGRESS_TYPE" = "alb" ]; then
+            helm_cmd+=" --set frontend.service.type=ClusterIP"
+        fi
+        
+        if [ "$DEBUG" = true ]; then
+            helm_cmd+=" --debug"
+        fi
+        
+        log INFO "Executing: ${helm_cmd}"
+        eval "$helm_cmd"
+        log SUCCESS "LangSmith upgraded with deployment feature enabled"
     else
-        log INFO "LangSmith is already installed"
+        # Pre-v12: just check if LangSmith is installed
+        if ! check_langsmith_installed; then
+            log WARNING "LangSmith is not installed. Installing LangSmith first..."
+            install_langsmith
+        else
+            log INFO "LangSmith is already installed"
+        fi
     fi
     
     # Create LangSmith Deployment configuration
