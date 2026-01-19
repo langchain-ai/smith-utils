@@ -679,6 +679,52 @@ EOF
         fi
     fi
     
+    # Disable ingress for LangGraph Cloud to avoid conflict with LangSmith ingress
+    # This applies to both ALB and nginx ingress types since LangSmith already
+    # provides the main ingress and LangGraph Cloud services are accessed via
+    # LoadBalancer services or through internal cluster routing
+    log INFO "Disabling ingress for LangGraph Cloud (using LangSmith ingress instead)"
+    if grep -q "^ingress:" "$LD_CONFIG_YAML"; then
+        $SED_CMD -i.bak \
+            -e "/^ingress:/,/^[a-zA-Z]/ { /enabled:/ s/enabled:.*/enabled: false/ }" \
+            "$LD_CONFIG_YAML"
+        rm -f "${LD_CONFIG_YAML}.bak"
+    else
+        # Add ingress section with disabled state
+        cat >> "$LD_CONFIG_YAML" << EOF
+
+ingress:
+  enabled: false
+EOF
+    fi
+    
+    # Add LangGraph Cloud license key (uses same license as LangSmith)
+    log INFO "Adding LangGraph Cloud license key configuration"
+    escaped_license=$(printf '%s\n' "$LicenseKey" | sed 's/[\/&]/\\&/g')
+    if grep -q "^config:" "$LD_CONFIG_YAML"; then
+        # Add langgraphCloudLicenseKey under config section
+        $SED_CMD -i.bak "/^config:/a\\  langgraphCloudLicenseKey: \"${escaped_license}\"" "$LD_CONFIG_YAML"
+        rm -f "${LD_CONFIG_YAML}.bak"
+    fi
+    
+    # For nginx ingress (non-cloud environments like Minikube), use ClusterIP services
+    # instead of LoadBalancer since LoadBalancer won't get external IPs without a tunnel
+    if [ "$INGRESS_TYPE" = "nginx" ]; then
+        log INFO "Configuring LangGraph Cloud services for nginx ingress (ClusterIP)"
+        cat >> "$LD_CONFIG_YAML" << EOF
+
+# LangGraph Cloud API Server service configuration (ClusterIP for nginx ingress)
+apiServer:
+  service:
+    type: ClusterIP
+
+# LangGraph Cloud Studio service configuration (ClusterIP for nginx ingress)
+studio:
+  service:
+    type: ClusterIP
+EOF
+    fi
+    
     log SUCCESS "LangSmith Deployment configuration file created: ${LD_CONFIG_YAML}"
 }
 

@@ -1,6 +1,9 @@
 # Environment configuration - contains sensitive data
 config/.env
 
+# Helm
+helm
+
 # Generated configuration files
 config/ls_config.yaml
 config/lp_config.yaml

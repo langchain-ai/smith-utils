@@ -54,7 +54,7 @@ queue:
     resources:
       requests:
         cpu: 100m
-        memory: 500Mi
+        memory: 256Mi
 
 postgres:
   persistence:
@@ -62,8 +62,8 @@ postgres:
   statefulSet:
     resources:
       requests:
-        cpu: 200m
-        memory: 500Mi
+        cpu: 100m
+        memory: 256Mi
 
 redis:
   persistence:
@@ -71,8 +71,8 @@ redis:
   statefulSet:
     resources:
       requests:
-        cpu: 200m
-        memory: 500Mi
+        cpu: 100m
+        memory: 256Mi
 
 clickhouse:
   statefulSet:
