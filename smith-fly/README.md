@@ -15,6 +15,8 @@ Key capabilities:
 - Credential management
 - Installation status checking
 - Clean uninstallation for resource cleanup
+- LangSmith Deployments UI enabled by default (shows in LangSmith menu)
+- Shared cluster support (multiple installations without CRD conflicts)
 
 ## Requirements
 
@@ -83,11 +85,17 @@ config:
 # Install LangSmith with debug output
 ./smith-fly.sh up -l --debug
 
+# Install LangSmith with reduced replicas (for resource-constrained environments)
+./smith-fly.sh up -l -r 1
+
 # Install LangSmith Deployment (auto-installs LangSmith if needed)
 ./smith-fly.sh up -ld
 
 # Install LangSmith Deployment with nginx ingress
 ./smith-fly.sh up -ld -i nginx
+
+# Install LangSmith Deployment with minimal resources (e.g., Minikube)
+./smith-fly.sh up -ld -i nginx -r 1
 
 # Uninstall everything
 ./smith-fly.sh down
@@ -96,7 +104,7 @@ config:
 ### Command Options
 
 ```
-Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [--debug]
+Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [-r REPLICAS] [-i INGRESS] [--debug]
 
 Actions:
     up      Spin up/install LangSmith or LangSmith Deployment
@@ -104,11 +112,14 @@ Actions:
     status  Check installation status of LangSmith and LangSmith Deployment
 
 Options (for 'up' action):
-    -l      Install LangSmith
-    -ld     Install LangSmith Deployment
-    -v      Specify version (optional)
-    -i      Ingress type: alb (default) or nginx
-    --debug Enable Helm debug output (optional)
+    -l        Install LangSmith
+    -ld       Install LangSmith Deployment
+    -v        Specify version (optional)
+    -i        Ingress type: alb (default) or nginx
+    -r        Set replica count for all components (e.g., -r 1 for minimal setup)
+              When -r 1 is used, CPU/memory requests are automatically reduced
+              for resource-constrained environments (Minikube, k3s, etc.)
+    --debug   Enable Helm debug output (optional)
 ```
 
 ### Status Output Example
@@ -129,10 +140,12 @@ LangSmith:
 LangSmith Deployment:
   Status:   Not Installed
 
-Ingress:   http://192.168.49.2
+Ingress:   http://192.168.49.2.nip.io
 
 ==========================================================================
 ```
+
+> **Note**: For nginx ingress, IP addresses are automatically converted to `nip.io` DNS names for Kubernetes Ingress compatibility.
 
 ### Configuration Setup
 
@@ -275,6 +288,17 @@ kubectl delete namespace $NAMESPACE
 - **CPU**: ~20 cores
 - **Memory**: ~50Gi
 
+### Minimal Resource Mode
+
+For resource-constrained environments (Minikube, k3s, local development), use the `-r 1` flag:
+
+```bash
+./smith-fly.sh up -l -r 1          # LangSmith with minimal resources
+./smith-fly.sh up -ld -i nginx -r 1  # Full stack with minimal resources
+```
+
+This sets all components to 1 replica and automatically reduces CPU/memory requests.
+
 **Important**: This is a test environment - delete the installation immediately after testing/reproduction to avoid unnecessary resource consumption and costs. Use `./smith-fly.sh down` to clean up all resources.
 
 ## Platform Compatibility
@@ -285,6 +309,10 @@ kubectl delete namespace $NAMESPACE
 - Azure (AKS)
 - On-premise Kubernetes
 - Any Kubernetes distribution (k3s, microk8s, etc.)
+
+### Shared Cluster Support
+
+The script supports deploying multiple LangSmith installations in different namespaces on the same cluster. It automatically skips CRD creation (`operator.createCRDs=false`) to avoid Helm ownership conflicts when CRDs are already present from another installation.
 
 ### Ingress Configuration
 
@@ -311,7 +339,7 @@ ingress:
   annotations: {}
 ```
 
-The script automatically detects ingress endpoints using both hostname (AWS) and IP (GKE, AKS, on-prem) formats.
+The script automatically detects ingress endpoints using both hostname (AWS) and IP (GKE, AKS, on-prem) formats. For nginx ingress with IP addresses, the script automatically converts them to `nip.io` DNS names (e.g., `192.168.49.2.nip.io`) for Kubernetes Ingress compatibility.
 
 ## Security Notes
 
@@ -319,6 +347,7 @@ The script automatically detects ingress endpoints using both hostname (AWS) and
 - Secrets are generated using OpenSSL with 32-byte entropy
 - Credentials are displayed once after installation - save them securely
 - Configuration files containing secrets are created locally - handle with care
+- When deploying LangSmith Deployment on top of an existing LangSmith installation (`up -ld` after `up -l`), secrets are automatically preserved from the existing configuration to ensure consistency
 
 **Production Deployments**: For production use, please follow the official LangChain deployment guides which include:
 - Proper secret management (e.g., HashiCorp Vault, AWS Secrets Manager)
@@ -352,6 +381,9 @@ smith-fly/
 - [ ] Support custom namespace names
 - [x] Add installation status check (`status` action)
 - [x] Support multiple ingress types (ALB/nginx via `-i` flag)
+- [x] Add replica count configuration (`-r` flag for minimal resources)
+- [x] Support shared clusters (automatic CRD conflict handling)
+- [x] Preserve secrets when upgrading LangSmith to LangSmith Deployment
 - [ ] Support external database configuration
 - [ ] Add metrics collection integration
 - [ ] Support air-gapped installations
