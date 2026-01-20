@@ -20,6 +20,7 @@ ingress:
 
 backend:
   deployment:
+    replicas: 1
     resources:
       requests:
         cpu: 100m
@@ -29,6 +30,7 @@ frontend:
   service:
     type: ClusterIP  # Use ClusterIP when using Ingress (ALB/nginx) controllers
   deployment:
+    replicas: 1
     resources:
       requests:
         cpu: 100m
@@ -36,6 +38,7 @@ frontend:
 
 platformBackend:
   deployment:
+    replicas: 1
     resources:
       requests:
         cpu: 100m
@@ -43,6 +46,7 @@ platformBackend:
 
 playground:
   deployment:
+    replicas: 1
     resources:
       requests:
         cpu: 100m
@@ -55,6 +59,25 @@ queue:
       requests:
         cpu: 100m
         memory: 256Mi
+
+ingestQueue:
+  replicas: 1
+
+aceBackend:
+  deployment:
+    replicas: 1
+
+hostBackend:
+  deployment:
+    replicas: 1
+
+listener:
+  deployment:
+    replicas: 1
+
+operator:
+  deployment:
+    replicas: 1
 
 postgres:
   persistence:

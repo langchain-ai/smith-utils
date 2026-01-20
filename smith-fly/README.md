@@ -32,8 +32,8 @@ Key capabilities:
   - **CPU**: ~20 cores available
   - **Memory**: ~50Gi available
   - Ingress controller configured:
-    - **AWS**: ALB Ingress Controller (default)
-    - **Non-AWS**: nginx-ingress controller (use `-i nginx` flag)
+    - **AWS EKS**: ALB Ingress Controller (auto-detected)
+    - **Non-AWS**: nginx-ingress controller (auto-detected)
   - StorageClass for persistent volumes
 
 ### Configuration Files
@@ -73,10 +73,13 @@ config:
 # Check installation status
 ./smith-fly.sh status
 
-# Install LangSmith only (uses ALB ingress by default)
+# Install LangSmith (ingress type auto-detected based on cluster)
 ./smith-fly.sh up -l
 
-# Install LangSmith with nginx ingress (for non-AWS clusters)
+# Install LangSmith with ALB ingress (override auto-detect for AWS EKS)
+./smith-fly.sh up -l -i alb
+
+# Install LangSmith with nginx ingress (override auto-detect)
 ./smith-fly.sh up -l -i nginx
 
 # Install LangSmith with specific version
@@ -85,17 +88,11 @@ config:
 # Install LangSmith with debug output
 ./smith-fly.sh up -l --debug
 
-# Install LangSmith with reduced replicas (for resource-constrained environments)
-./smith-fly.sh up -l -r 1
-
 # Install LangSmith Deployment (auto-installs LangSmith if needed)
 ./smith-fly.sh up -ld
 
-# Install LangSmith Deployment with nginx ingress
+# Install LangSmith Deployment with specific ingress (override auto-detect)
 ./smith-fly.sh up -ld -i nginx
-
-# Install LangSmith Deployment with minimal resources (e.g., Minikube)
-./smith-fly.sh up -ld -i nginx -r 1
 
 # Uninstall everything
 ./smith-fly.sh down
@@ -104,7 +101,7 @@ config:
 ### Command Options
 
 ```
-Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [-r REPLICAS] [-i INGRESS] [--debug]
+Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [-i INGRESS] [--debug]
 
 Actions:
     up      Spin up/install LangSmith or LangSmith Deployment
@@ -115,10 +112,7 @@ Options (for 'up' action):
     -l        Install LangSmith
     -ld       Install LangSmith Deployment
     -v        Specify version (optional)
-    -i        Ingress type: alb (default) or nginx
-    -r        Set replica count for all components (e.g., -r 1 for minimal setup)
-              When -r 1 is used, CPU/memory requests are automatically reduced
-              for resource-constrained environments (Minikube, k3s, etc.)
+    -i        Ingress type: alb or nginx (auto-detected if not specified)
     --debug   Enable Helm debug output (optional)
 ```
 
@@ -288,16 +282,21 @@ kubectl delete namespace $NAMESPACE
 - **CPU**: ~20 cores
 - **Memory**: ~50Gi
 
-### Minimal Resource Mode
+### Replica Configuration
 
-For resource-constrained environments (Minikube, k3s, local development), use the `-r 1` flag:
+All component replicas are configured in `config/config.yaml` with a default of 1 replica per component. This can be adjusted by editing the config file before installation:
 
-```bash
-./smith-fly.sh up -l -r 1          # LangSmith with minimal resources
-./smith-fly.sh up -ld -i nginx -r 1  # Full stack with minimal resources
+```yaml
+backend:
+  deployment:
+    replicas: 1  # Adjust as needed
+
+frontend:
+  deployment:
+    replicas: 1  # Adjust as needed
+
+# ... other components
 ```
-
-This sets all components to 1 replica and automatically reduces CPU/memory requests.
 
 **Important**: This is a test environment - delete the installation immediately after testing/reproduction to avoid unnecessary resource consumption and costs. Use `./smith-fly.sh down` to clean up all resources.
 
@@ -316,14 +315,21 @@ The script supports deploying multiple LangSmith installations in different name
 
 ### Ingress Configuration
 
-The script supports two ingress types:
+The script **auto-detects** the cluster type and configures the appropriate ingress:
 
-| Ingress Type | Flag | Use Case |
-|--------------|------|----------|
-| **ALB** (default) | `-i alb` or omit | AWS EKS with ALB Ingress Controller |
-| **nginx** | `-i nginx` | GKE, AKS, on-premise, k3s, minikube, etc. |
+| Cluster Type | Ingress Type | Auto-Detection |
+|--------------|--------------|----------------|
+| **AWS EKS** | ALB | Detected via `eks.amazonaws.com` labels or `aws://` provider ID |
+| **Other clusters** | nginx | Default for GKE, AKS, on-premise, k3s, minikube, etc. |
 
-**ALB Ingress (Default):**
+Use the `-i` flag to override auto-detection if needed:
+
+```bash
+./smith-fly.sh up -l -i alb    # Force ALB ingress
+./smith-fly.sh up -l -i nginx  # Force nginx ingress
+```
+
+**ALB Ingress (AWS EKS):**
 ```yaml
 ingress:
   ingressClassName: alb
@@ -332,7 +338,7 @@ ingress:
     alb.ingress.kubernetes.io/target-type: ip
 ```
 
-**nginx Ingress:**
+**nginx Ingress (Non-AWS):**
 ```yaml
 ingress:
   ingressClassName: nginx
@@ -381,7 +387,8 @@ smith-fly/
 - [ ] Support custom namespace names
 - [x] Add installation status check (`status` action)
 - [x] Support multiple ingress types (ALB/nginx via `-i` flag)
-- [x] Add replica count configuration (`-r` flag for minimal resources)
+- [x] Auto-detect cluster type for ingress (EKS -> ALB, others -> nginx)
+- [x] Configure replicas in `config.yaml` (default: 1 per component)
 - [x] Support shared clusters (automatic CRD conflict handling)
 - [x] Preserve secrets when upgrading LangSmith to LangSmith Deployment
 - [ ] Support external database configuration

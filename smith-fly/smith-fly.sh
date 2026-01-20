@@ -30,9 +30,8 @@ INSTALL_LD=false
 VERSION=""
 DEBUG=false
 NAMESPACE=""
-INGRESS_TYPE="alb"  # Default to ALB, can be 'alb' or 'nginx'
+INGRESS_TYPE=""  # Empty means auto-detect; 'alb' or 'nginx' if explicitly set
 IS_V12_PLUS=true  # Default to true (latest version assumes v12+)
-REPLICA_COUNT=""  # Optional replica count override
 initialOrgAdminEmail=""
 LicenseKey=""
 apiKeySalt=""
@@ -145,6 +144,49 @@ detect_version() {
 }
 
 ##############################################################################
+# Function: detect_cluster_type
+# Description: Detects if the current Kubernetes cluster is AWS EKS
+# Returns: 0 if EKS detected, 1 otherwise
+##############################################################################
+detect_cluster_type() {
+    # Check node labels for EKS-specific labels
+    if kubectl get nodes -o jsonpath='{.items[0].metadata.labels}' 2>/dev/null | grep -q "eks.amazonaws.com"; then
+        return 0  # EKS detected
+    fi
+    
+    # Check node provider ID for AWS (format: aws://region/instance-id)
+    if kubectl get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null | grep -q "^aws://"; then
+        return 0  # AWS detected
+    fi
+    
+    return 1  # Not EKS
+}
+
+##############################################################################
+# Function: set_ingress_type
+# Description: Auto-detects cluster type and sets ingress accordingly
+#              User-specified -i flag takes precedence over auto-detection
+##############################################################################
+set_ingress_type() {
+    # If user explicitly set ingress type via -i flag, use that
+    if [ -n "$INGRESS_TYPE" ]; then
+        log INFO "Using user-specified ingress type: ${INGRESS_TYPE}"
+        return
+    fi
+    
+    # Auto-detect based on cluster type
+    log INFO "Auto-detecting cluster type for ingress configuration..."
+    
+    if detect_cluster_type; then
+        INGRESS_TYPE="alb"
+        log SUCCESS "AWS EKS detected - using ALB ingress"
+    else
+        INGRESS_TYPE="nginx"
+        log INFO "Non-EKS cluster detected - using nginx ingress (default)"
+    fi
+}
+
+##############################################################################
 # Function: show_usage
 # Description: Displays script usage information
 ##############################################################################
@@ -161,21 +203,19 @@ Options (for 'up' action):
     -l      Install LangSmith
     -ld     Install LangSmith Deployment
     -v      Specify version (optional)
-    -i      Ingress type: alb (default) or nginx
-    -r      Specify replica count for all components (optional, -r 1 also reduces resource requests)
+    -i      Ingress type: alb or nginx (auto-detected if not specified)
     --debug Enable Helm debug output (optional)
 
 Examples:
-    $0 up -l                     # Install LangSmith only (latest v12+ version, ALB ingress)
-    $0 up -l -i nginx            # Install LangSmith with nginx ingress
+    $0 up -l                     # Install LangSmith (ingress auto-detected based on cluster)
+    $0 up -l -i alb              # Install LangSmith with ALB ingress (override auto-detect)
+    $0 up -l -i nginx            # Install LangSmith with nginx ingress (override auto-detect)
     $0 up -l -v 0.12.3           # Install LangSmith v12+ with specific version
     $0 up -l -v 0.11.5           # Install LangSmith pre-v12 with legacy config format
-    $0 up -l -r 1                # Install LangSmith with 1 replica per component
     $0 up -l --debug             # Install LangSmith with debug output
     $0 up -ld                    # Install LangSmith Deployment (automatically installs LangSmith if not present)
     $0 up -ld -i nginx           # Install LangSmith Deployment with nginx ingress
     $0 up -ld -v 0.11.0          # Install LangSmith Deployment with pre-v12 config format
-    $0 up -ld -r 1               # Install LangSmith Deployment with 1 replica per component
     $0 down                      # Remove both LangSmith and LangSmith Deployment
     $0 status                    # Check installation status of LangSmith and LangSmith Deployment
 
@@ -187,7 +227,8 @@ Notes:
     - Namespace is auto-generated from your local machine hostname
     - Version >= 0.12.0 uses new config format (config.deployment, config.hostname)
     - Version < 0.12.0 uses legacy config format (config.langgraphPlatform, langgraphPlatformLicenseKey)
-    - Ingress type defaults to ALB (AWS). Use -i nginx for non-AWS Kubernetes clusters
+    - Ingress type is auto-detected: AWS EKS -> ALB, other clusters -> nginx
+    - Use -i flag to override auto-detection (e.g., -i alb or -i nginx)
 
 EOF
     exit 1
@@ -289,18 +330,6 @@ parse_arguments() {
                 esac
                 shift 2
                 ;;
-            -r|--replicas)
-                if [ $# -lt 2 ]; then
-                    log ERROR "-r option requires a replica count argument"
-                    show_usage
-                fi
-                if ! [[ "$2" =~ ^[0-9]+$ ]]; then
-                    log ERROR "Replica count must be a positive integer"
-                    show_usage
-                fi
-                REPLICA_COUNT="$2"
-                shift 2
-                ;;
             *)
                 log ERROR "Unknown option: $1"
                 show_usage
@@ -332,10 +361,6 @@ parse_arguments() {
         
         if [ -n "$VERSION" ]; then
             log INFO "Version: ${VERSION}"
-        fi
-        
-        if [ -n "$REPLICA_COUNT" ]; then
-            log INFO "Replica Count: ${REPLICA_COUNT}"
         fi
         
         # Detect version format (v12+ or legacy)
@@ -595,52 +620,6 @@ install_langsmith() {
     if kubectl get crd lgps.apps.langchain.ai &> /dev/null; then
         log INFO "CRD lgps.apps.langchain.ai already exists, skipping CRD creation"
         helm_cmd+=" --set operator.createCRDs=false"
-    fi
-    
-    # Set replica count for all components if specified
-    if [ -n "$REPLICA_COUNT" ]; then
-        helm_cmd+=" --set backend.deployment.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set frontend.deployment.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set platformBackend.deployment.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set playground.deployment.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set queue.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set ingestQueue.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set aceBackend.deployment.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set hostBackend.deployment.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set listener.deployment.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set operator.deployment.replicas=${REPLICA_COUNT}"
-        log INFO "Setting replica count to ${REPLICA_COUNT} for all components"
-        
-        # When using minimal replicas, also reduce resource requests to fit in constrained environments
-        if [ "$REPLICA_COUNT" -eq 1 ]; then
-            log INFO "Applying minimal resource requests for single-replica deployment"
-            helm_cmd+=" --set backend.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set backend.deployment.resources.requests.memory=256Mi"
-            helm_cmd+=" --set frontend.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set frontend.deployment.resources.requests.memory=256Mi"
-            helm_cmd+=" --set platformBackend.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set platformBackend.deployment.resources.requests.memory=256Mi"
-            helm_cmd+=" --set playground.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set playground.deployment.resources.requests.memory=256Mi"
-            helm_cmd+=" --set queue.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set queue.deployment.resources.requests.memory=128Mi"
-            helm_cmd+=" --set ingestQueue.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set ingestQueue.deployment.resources.requests.memory=128Mi"
-            helm_cmd+=" --set aceBackend.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set aceBackend.deployment.resources.requests.memory=256Mi"
-            helm_cmd+=" --set hostBackend.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set hostBackend.deployment.resources.requests.memory=256Mi"
-            helm_cmd+=" --set listener.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set listener.deployment.resources.requests.memory=128Mi"
-            helm_cmd+=" --set operator.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set operator.deployment.resources.requests.memory=128Mi"
-            helm_cmd+=" --set postgres.statefulSet.resources.requests.cpu=50m"
-            helm_cmd+=" --set postgres.statefulSet.resources.requests.memory=128Mi"
-            helm_cmd+=" --set redis.statefulSet.resources.requests.cpu=50m"
-            helm_cmd+=" --set redis.statefulSet.resources.requests.memory=128Mi"
-            helm_cmd+=" --set clickhouse.statefulSet.resources.requests.cpu=100m"
-            helm_cmd+=" --set clickhouse.statefulSet.resources.requests.memory=256Mi"
-        fi
     fi
     
     # Add debug flag if enabled
@@ -1054,50 +1033,6 @@ EOF
             helm_cmd+=" --set frontend.service.type=ClusterIP"
         fi
         
-        # Set replica count for all components if specified
-        if [ -n "$REPLICA_COUNT" ]; then
-            helm_cmd+=" --set backend.deployment.replicas=${REPLICA_COUNT}"
-            helm_cmd+=" --set frontend.deployment.replicas=${REPLICA_COUNT}"
-            helm_cmd+=" --set platformBackend.deployment.replicas=${REPLICA_COUNT}"
-            helm_cmd+=" --set playground.deployment.replicas=${REPLICA_COUNT}"
-            helm_cmd+=" --set queue.replicas=${REPLICA_COUNT}"
-            helm_cmd+=" --set ingestQueue.replicas=${REPLICA_COUNT}"
-            helm_cmd+=" --set aceBackend.deployment.replicas=${REPLICA_COUNT}"
-            helm_cmd+=" --set hostBackend.deployment.replicas=${REPLICA_COUNT}"
-            helm_cmd+=" --set listener.deployment.replicas=${REPLICA_COUNT}"
-            helm_cmd+=" --set operator.deployment.replicas=${REPLICA_COUNT}"
-            
-            # When using minimal replicas, also reduce resource requests
-            if [ "$REPLICA_COUNT" -eq 1 ]; then
-                helm_cmd+=" --set backend.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set backend.deployment.resources.requests.memory=256Mi"
-                helm_cmd+=" --set frontend.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set frontend.deployment.resources.requests.memory=256Mi"
-                helm_cmd+=" --set platformBackend.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set platformBackend.deployment.resources.requests.memory=256Mi"
-                helm_cmd+=" --set playground.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set playground.deployment.resources.requests.memory=256Mi"
-                helm_cmd+=" --set queue.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set queue.deployment.resources.requests.memory=128Mi"
-                helm_cmd+=" --set ingestQueue.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set ingestQueue.deployment.resources.requests.memory=128Mi"
-                helm_cmd+=" --set aceBackend.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set aceBackend.deployment.resources.requests.memory=256Mi"
-                helm_cmd+=" --set hostBackend.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set hostBackend.deployment.resources.requests.memory=256Mi"
-                helm_cmd+=" --set listener.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set listener.deployment.resources.requests.memory=128Mi"
-                helm_cmd+=" --set operator.deployment.resources.requests.cpu=50m"
-                helm_cmd+=" --set operator.deployment.resources.requests.memory=128Mi"
-                helm_cmd+=" --set postgres.statefulSet.resources.requests.cpu=50m"
-                helm_cmd+=" --set postgres.statefulSet.resources.requests.memory=128Mi"
-                helm_cmd+=" --set redis.statefulSet.resources.requests.cpu=50m"
-                helm_cmd+=" --set redis.statefulSet.resources.requests.memory=128Mi"
-                helm_cmd+=" --set clickhouse.statefulSet.resources.requests.cpu=100m"
-                helm_cmd+=" --set clickhouse.statefulSet.resources.requests.memory=256Mi"
-            fi
-        fi
-        
         if [ "$DEBUG" = true ]; then
             helm_cmd+=" --debug"
         fi
@@ -1128,21 +1063,6 @@ EOF
     if [ -n "$VERSION" ]; then
         helm_cmd+=" --version ${VERSION}"
         log INFO "Installing LangSmith Deployment version: ${VERSION}"
-    fi
-    
-    # Set replica count for LangGraph Cloud components if specified
-    if [ -n "$REPLICA_COUNT" ]; then
-        helm_cmd+=" --set apiServer.deployment.replicas=${REPLICA_COUNT}"
-        helm_cmd+=" --set studio.deployment.replicas=${REPLICA_COUNT}"
-        log INFO "Setting replica count to ${REPLICA_COUNT} for LangGraph Cloud components"
-        
-        # When using minimal replicas, also reduce resource requests
-        if [ "$REPLICA_COUNT" -eq 1 ]; then
-            helm_cmd+=" --set apiServer.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set apiServer.deployment.resources.requests.memory=256Mi"
-            helm_cmd+=" --set studio.deployment.resources.requests.cpu=50m"
-            helm_cmd+=" --set studio.deployment.resources.requests.memory=256Mi"
-        fi
     fi
     
     # Add debug flag if enabled
@@ -1321,6 +1241,9 @@ main() {
     
     # Setup namespace
     setup_namespace
+    
+    # Auto-detect ingress type based on cluster (EKS -> ALB, others -> nginx)
+    set_ingress_type
     
     # Load configuration
     load_configuration
