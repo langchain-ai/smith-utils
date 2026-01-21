@@ -163,6 +163,100 @@ detect_cluster_type() {
 }
 
 ##############################################################################
+# Function: is_minikube_cluster
+# Description: Detects if the current Kubernetes cluster is Minikube
+# Returns: 0 if Minikube detected, 1 otherwise
+##############################################################################
+is_minikube_cluster() {
+    # Check if minikube command exists and is the current context
+    if command -v minikube &> /dev/null; then
+        local current_context
+        current_context=$(kubectl config current-context 2>/dev/null || echo "")
+        if [ "$current_context" = "minikube" ]; then
+            return 0  # Minikube detected
+        fi
+    fi
+    
+    # Check node labels for minikube-specific labels
+    if kubectl get nodes -o jsonpath='{.items[0].metadata.labels}' 2>/dev/null | grep -q "minikube.k8s.io"; then
+        return 0  # Minikube detected
+    fi
+    
+    # Check node name contains "minikube"
+    if kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null | grep -qi "minikube"; then
+        return 0  # Minikube detected
+    fi
+    
+    return 1  # Not Minikube
+}
+
+##############################################################################
+# Function: start_minikube_port_forward
+# Description: Starts port-forward to ingress-nginx-controller in background
+#              for Minikube installations where direct IP access doesn't work
+# Returns: 0 on success, 1 on failure
+##############################################################################
+start_minikube_port_forward() {
+    local port="${1:-8080}"
+    
+    log INFO "Starting port-forward to ingress-nginx-controller on port ${port}..."
+    
+    # Check if ingress-nginx-controller service exists
+    if ! kubectl get svc ingress-nginx-controller -n ingress-nginx &> /dev/null; then
+        log WARNING "ingress-nginx-controller service not found in ingress-nginx namespace"
+        return 1
+    fi
+    
+    # Kill any existing port-forward on the same port
+    pkill -f "kubectl port-forward.*ingress-nginx-controller.*${port}:80" 2>/dev/null || true
+    
+    # Start port-forward in background
+    nohup kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx "${port}:80" > /dev/null 2>&1 &
+    local pf_pid=$!
+    
+    # Wait a moment and verify it started
+    sleep 2
+    if kill -0 "$pf_pid" 2>/dev/null; then
+        log SUCCESS "Port-forward started successfully (PID: ${pf_pid})"
+        log INFO "LangSmith is accessible at http://127.0.0.1:${port}"
+        return 0
+    else
+        log ERROR "Failed to start port-forward"
+        return 1
+    fi
+}
+
+##############################################################################
+# Function: stop_minikube_port_forward
+# Description: Stops any running port-forward to ingress-nginx-controller
+#              Used during uninstallation on Minikube
+##############################################################################
+stop_minikube_port_forward() {
+    local port="${1:-8080}"
+    
+    log INFO "Checking for running port-forward processes..."
+    
+    # Find and kill port-forward processes for ingress-nginx-controller
+    local pf_pids
+    pf_pids=$(pgrep -f "kubectl port-forward.*ingress-nginx-controller" 2>/dev/null || echo "")
+    
+    if [ -n "$pf_pids" ]; then
+        log INFO "Stopping port-forward processes: ${pf_pids}"
+        pkill -f "kubectl port-forward.*ingress-nginx-controller" 2>/dev/null || true
+        sleep 1
+        
+        # Verify processes were killed
+        if pgrep -f "kubectl port-forward.*ingress-nginx-controller" &>/dev/null; then
+            log WARNING "Some port-forward processes may still be running"
+        else
+            log SUCCESS "Port-forward processes stopped successfully"
+        fi
+    else
+        log INFO "No port-forward processes found"
+    fi
+}
+
+##############################################################################
 # Function: set_ingress_type
 # Description: Auto-detects cluster type and sets ingress accordingly
 #              User-specified -i flag takes precedence over auto-detection
@@ -1092,6 +1186,14 @@ display_langsmith_info() {
     local max_attempts=30
     local attempt=0
     local endpoint_pending=false
+    local is_minikube=false
+    local minikube_port="8080"
+    
+    # Check if running on Minikube
+    if is_minikube_cluster; then
+        is_minikube=true
+        log INFO "Minikube cluster detected - will use port-forward for access"
+    fi
     
     while [ $attempt -lt $max_attempts ]; do
         # Try Ingress resource first (v12+ and ALB/nginx ingress configurations)
@@ -1120,7 +1222,22 @@ display_langsmith_info() {
         sleep 10
     done
     
-    if [ -z "$endpoint" ]; then
+    # For Minikube, start port-forward and use localhost endpoint
+    if [ "$is_minikube" = true ]; then
+        log INFO "Setting up port-forward for Minikube access..."
+        if start_minikube_port_forward "$minikube_port"; then
+            endpoint="127.0.0.1:${minikube_port}"
+        else
+            # Fallback: show the Minikube IP but warn user
+            if [ -z "$endpoint" ]; then
+                endpoint=$(minikube ip 2>/dev/null || echo "")
+            fi
+            if [ -z "$endpoint" ]; then
+                endpoint_pending=true
+                endpoint="YOUR_LANGSMITH_ENDPOINT"
+            fi
+        fi
+    elif [ -z "$endpoint" ]; then
         endpoint_pending=true
         endpoint="YOUR_LANGSMITH_ENDPOINT"
     fi
@@ -1146,6 +1263,12 @@ display_langsmith_info() {
     echo -e "Password:  ${GREEN}${initialOrgAdminPassword}${NC}"
     echo ""
     echo -e "${YELLOW}⚠️  Important: Save these credentials securely!${NC}"
+    if [ "$is_minikube" = true ]; then
+        echo ""
+        echo -e "${YELLOW}⚠️  Minikube Note: Port-forward is running in the background.${NC}"
+        echo -e "${YELLOW}    If you restart your terminal, run:${NC}"
+        echo -e "    ${GREEN}kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx ${minikube_port}:80${NC}"
+    fi
     echo ""
     echo -e "${RED}⚠️  WARNING: Resource Usage Alert${NC}"
     echo -e "${RED}    Delete right after reproduction if billable, as amount of using resources per installation is high!${NC}"
@@ -1179,6 +1302,12 @@ EOF
 ##############################################################################
 uninstall_all() {
     log INFO "Starting uninstallation process for both LangSmith and LangSmith Deployment..."
+    
+    # Stop port-forward if running on Minikube
+    if is_minikube_cluster; then
+        log INFO "Minikube cluster detected - stopping port-forward..."
+        stop_minikube_port_forward
+    fi
     
     # Check if namespace exists
     if ! kubectl get namespace "$NAMESPACE" &> /dev/null; then
