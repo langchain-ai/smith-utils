@@ -24,7 +24,7 @@ backend:
     resources:
       requests:
         cpu: 100m
-        memory: 500Mi
+        memory: 256Mi
 
 frontend:
   service:
@@ -34,7 +34,7 @@ frontend:
     resources:
       requests:
         cpu: 100m
-        memory: 500Mi
+        memory: 256Mi
 
 platformBackend:
   deployment:
@@ -42,7 +42,7 @@ platformBackend:
     resources:
       requests:
         cpu: 100m
-        memory: 500Mi
+        memory: 256Mi
 
 playground:
   deployment:
@@ -50,7 +50,7 @@ playground:
     resources:
       requests:
         cpu: 100m
-        memory: 500Mi
+        memory: 256Mi
 
 queue:
   replicas: 1
@@ -61,7 +61,8 @@ queue:
         memory: 256Mi
 
 ingestQueue:
-  replicas: 1
+  deployment:
+    replicas: 1
 
 aceBackend:
   deployment:
@@ -102,4 +103,4 @@ clickhouse:
     resources:
       requests:
         cpu: 200m
-        memory: 500Mi
+        memory: 256Mi
