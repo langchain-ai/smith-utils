@@ -1,4 +1,8 @@
 # Configuration for LangSmith
+# MINIMAL TESTABLE CONFIGURATION - Not for production use
+# Official minimum: 16 vCPU, 64Gi RAM cluster-wide
+# This config: ~4 vCPU, ~12Gi RAM (testing only)
+
 config:
   langsmithLicenseKey: ""
   apiKeySalt: ""
@@ -18,67 +22,134 @@ ingress:
     alb.ingress.kubernetes.io/target-type: ip
 
 
+# =============================================================================
+# CORE BACKEND SERVICES (minimal resources for testing)
+# =============================================================================
+
 backend:
   deployment:
     replicas: 1
     resources:
       requests:
-        cpu: 100m
-        memory: 256Mi
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
 
 frontend:
   service:
-    type: ClusterIP  # Use ClusterIP when using Ingress (ALB/nginx) controllers
+    type: ClusterIP
   deployment:
     replicas: 1
     resources:
       requests:
-        cpu: 100m
-        memory: 256Mi
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
 
 platformBackend:
   deployment:
     replicas: 1
     resources:
       requests:
-        cpu: 100m
-        memory: 256Mi
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
 
 playground:
   deployment:
     replicas: 1
     resources:
       requests:
-        cpu: 100m
-        memory: 256Mi
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
 
 queue:
-  replicas: 1
   deployment:
+    replicas: 1
     resources:
       requests:
-        cpu: 100m
-        memory: 256Mi
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+# =============================================================================
+# LANGGRAPH DEPLOYMENT COMPONENTS (for -ld flag)
+# NOTE: These components are for v0.12+ only. For v0.11 and earlier, these
+# settings will be ignored by Helm (no error, just won't apply).
+# v0.11 uses different component names/structure managed by langgraphPlatform.
+# =============================================================================
 
 ingestQueue:
   deployment:
     replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
 
 aceBackend:
   deployment:
     replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
 
 hostBackend:
   deployment:
     replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
 
 listener:
   deployment:
     replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
 
 operator:
   deployment:
     replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+# =============================================================================
+# STATEFUL DATA SERVICES (require more memory than app services)
+# Official minimum: ClickHouse 16Gi, Postgres 8Gi, Redis 4Gi
+# Testing minimum below - may have performance issues
+# =============================================================================
 
 postgres:
   persistence:
@@ -88,6 +159,9 @@ postgres:
       requests:
         cpu: 100m
         memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
 
 redis:
   persistence:
@@ -96,11 +170,19 @@ redis:
     resources:
       requests:
         cpu: 100m
-        memory: 256Mi
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
 
+# ClickHouse is the most resource-intensive component
+# Official minimum is 16Gi
 clickhouse:
   statefulSet:
     resources:
       requests:
         cpu: 200m
         memory: 256Mi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
