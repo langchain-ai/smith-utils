@@ -192,6 +192,15 @@ is_minikube_cluster() {
 }
 
 ##############################################################################
+# Function: is_keda_installed
+# Description: Checks if KEDA (Kubernetes Event-Driven Autoscaling) is installed
+# Returns: 0 if KEDA CRDs exist, 1 otherwise
+##############################################################################
+is_keda_installed() {
+    kubectl get crd scaledobjects.keda.sh &> /dev/null
+}
+
+##############################################################################
 # Function: start_minikube_port_forward
 # Description: Starts port-forward to ingress-nginx-controller in background
 #              for Minikube installations where direct IP access doesn't work
@@ -722,6 +731,12 @@ install_langsmith() {
         helm_cmd+=" --set operator.createCRDs=false"
     fi
     
+    # Check if KEDA is installed - disable if not available (typical for Minikube/local clusters)
+    if ! is_keda_installed; then
+        log INFO "KEDA not installed, disabling KEDA integration for operator"
+        helm_cmd+=" --set operator.kedaEnabled=false"
+    fi
+    
     # Add debug flag if enabled
     if [ "$DEBUG" = true ]; then
         helm_cmd+=" --debug"
@@ -808,11 +823,18 @@ create_langsmith_deployment_config() {
         log INFO "Generating v12+ LangSmith Deployment configuration (langgraph-cloud chart)"
         
         # Add operator section for v12+
+        # Only skip CRD creation if CRD already exists (shared cluster scenario)
+        local create_crds="true"
+        if kubectl get crd lgps.apps.langchain.ai &> /dev/null; then
+            log INFO "CRD lgps.apps.langchain.ai already exists, skipping CRD creation in LD config"
+            create_crds="false"
+        fi
+        
         if ! grep -q "^operator:" "$LD_CONFIG_YAML"; then
             cat >> "$LD_CONFIG_YAML" << EOF
 
 operator:
-  createCRDs: false
+  createCRDs: ${create_crds}
   watchNamespaces: "${NAMESPACE}"
 EOF
         fi
@@ -1132,9 +1154,18 @@ EOF
         helm_cmd+=" --wait --timeout 30m"
         helm_cmd+=" --hide-notes"
         
-        # Skip CRD creation on upgrade - CRDs are cluster-scoped and may be owned by another release
+        # Only skip CRD creation if CRD already exists (shared cluster scenario)
         # This prevents "invalid ownership metadata" errors in shared clusters
-        helm_cmd+=" --set operator.createCRDs=false"
+        if kubectl get crd lgps.apps.langchain.ai &> /dev/null; then
+            log INFO "CRD lgps.apps.langchain.ai already exists, skipping CRD creation"
+            helm_cmd+=" --set operator.createCRDs=false"
+        fi
+        
+        # Check if KEDA is installed - disable if not available (typical for Minikube/local clusters)
+        if ! is_keda_installed; then
+            log INFO "KEDA not installed, disabling KEDA integration for operator"
+            helm_cmd+=" --set operator.kedaEnabled=false"
+        fi
         
         if [ "$INGRESS_TYPE" = "nginx" ] || [ "$INGRESS_TYPE" = "alb" ]; then
             helm_cmd+=" --set frontend.service.type=ClusterIP"
