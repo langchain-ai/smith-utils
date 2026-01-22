@@ -37,6 +37,7 @@ LicenseKey=""
 apiKeySalt=""
 jwtSecret=""
 initialOrgAdminPassword=""
+LANGSMITH_HOSTNAME=""  # Optional: custom hostname for LangSmith (can be set via .env)
 
 # Color codes for output
 RED='\033[0;31m'
@@ -218,7 +219,7 @@ start_minikube_port_forward() {
     sleep 2
     if kill -0 "$pf_pid" 2>/dev/null; then
         log SUCCESS "Port-forward started successfully (PID: ${pf_pid})"
-        log INFO "LangSmith is accessible at http://127.0.0.1:${port}"
+        log INFO "LangSmith is accessible at http://localhost:${port}"
         return 0
     else
         log ERROR "Failed to start port-forward"
@@ -493,6 +494,11 @@ load_configuration() {
         exit 1
     fi
     
+    # Load optional LANGSMITH_HOSTNAME if set in .env
+    if [ -n "${LANGSMITH_HOSTNAME:-}" ]; then
+        log INFO "Custom hostname configured: ${LANGSMITH_HOSTNAME}"
+    fi
+    
     log SUCCESS "Configuration loaded successfully"
 }
 
@@ -728,9 +734,6 @@ install_langsmith() {
     eval "$helm_cmd"
     
     log SUCCESS "LangSmith installed successfully"
-    
-    # Display connection information
-    display_langsmith_info
 }
 
 ##############################################################################
@@ -1080,29 +1083,39 @@ install_langsmith_deployment() {
     if [ "$IS_V12_PLUS" = true ]; then
         log INFO "Enabling deployment feature in LangSmith (v12+)..."
         
-        # Get ingress hostname
-        local ingress_hostname
-        ingress_hostname=$(get_ingress_hostname 2>/dev/null || echo "")
-        if [ -z "$ingress_hostname" ] || [ "$ingress_hostname" = "<pending-ingress-hostname>" ]; then
-            # Fallback to Minikube IP if ingress not ready yet
-            ingress_hostname="192.168.49.2"
-        fi
-        
-        # For nginx ingress, if hostname is an IP address, use nip.io for DNS resolution
-        # Kubernetes Ingress requires a DNS name, not an IP address
-        if [ "$INGRESS_TYPE" = "nginx" ]; then
-            if [[ "$ingress_hostname" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                log INFO "Converting IP address to nip.io DNS name for nginx ingress"
-                ingress_hostname="${ingress_hostname}.nip.io"
-            fi
-        fi
-        
         # Create/update LangSmith config with deployment enabled
         create_langsmith_config
         
+        # Determine hostname for deployment (required in v12+ when deployment is enabled)
+        # Priority: 1) User-specified LANGSMITH_HOSTNAME, 2) Existing ingress, 3) localhost fallback
+        local ingress_hostname=""
+        
+        # Priority 1: User-specified hostname from .env
+        if [ -n "$LANGSMITH_HOSTNAME" ]; then
+            ingress_hostname="$LANGSMITH_HOSTNAME"
+            log INFO "Using user-specified hostname: ${ingress_hostname}"
+        # Priority 2: Try to get from existing ingress (for upgrades)
+        elif ! is_minikube_cluster; then
+            ingress_hostname=$(get_ingress_hostname 2>/dev/null || echo "")
+            # Convert IP to nip.io if needed for nginx ingress
+            if [ -n "$ingress_hostname" ] && [ "$ingress_hostname" != "<pending-ingress-hostname>" ] && [ "$INGRESS_TYPE" = "nginx" ]; then
+                if [[ "$ingress_hostname" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    log INFO "Converting IP address to nip.io DNS name for nginx ingress"
+                    ingress_hostname="${ingress_hostname}.nip.io"
+                fi
+            fi
+        fi
+        
+        # Priority 3: Fallback to localhost (works with port-forward)
+        if [ -z "$ingress_hostname" ] || [ "$ingress_hostname" = "<pending-ingress-hostname>" ]; then
+            ingress_hostname="localhost"
+            log INFO "Using default hostname: localhost (use port-forward to access)"
+        fi
+        
         # Add deployment section to ls_config.yaml for LangSmith chart
-        log INFO "Adding config.deployment.enabled and config.hostname to LangSmith config"
+        # Always include both deployment.enabled AND hostname (required in v12+)
         local temp_insert=$(mktemp)
+        log INFO "Adding config.deployment.enabled and config.hostname to LangSmith config"
         cat > "$temp_insert" << EOF
   deployment:
     enabled: true
@@ -1226,7 +1239,7 @@ display_langsmith_info() {
     if [ "$is_minikube" = true ]; then
         log INFO "Setting up port-forward for Minikube access..."
         if start_minikube_port_forward "$minikube_port"; then
-            endpoint="127.0.0.1:${minikube_port}"
+            endpoint="localhost:${minikube_port}"
         else
             # Fallback: show the Minikube IP but warn user
             if [ -z "$endpoint" ]; then
@@ -1389,6 +1402,11 @@ main() {
             
             if [ "$INSTALL_LD" = true ]; then
                 install_langsmith_deployment
+            fi
+            
+            # Display connection information after any installation
+            if [ "$INSTALL_LS" = true ] || [ "$INSTALL_LD" = true ]; then
+                display_langsmith_info
             fi
             ;;
         down)

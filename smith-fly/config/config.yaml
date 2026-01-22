@@ -1,9 +1,11 @@
 # Configuration for LangSmith
 # MINIMAL TESTABLE CONFIGURATION - Not for production use
 # Official minimum: 16 vCPU, 64Gi RAM cluster-wide
-# This config: ~4 vCPU, ~12Gi RAM (testing only)
+# This config: ~2 vCPU, ~6Gi RAM requests (bare minimum testing only)
 
 config:
+  # hostname: Added dynamically by smith-fly.sh when deployment is enabled (v12+).
+  #   Override with LANGSMITH_HOSTNAME in .env for custom domain.
   langsmithLicenseKey: ""
   apiKeySalt: ""
   authType: "mixed"
@@ -31,11 +33,11 @@ backend:
     replicas: 1
     resources:
       requests:
-        cpu: 50m
-        memory: 128Mi
-      limits:
-        cpu: 500m
+        cpu: 200m
         memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
 
 frontend:
   service:
@@ -44,106 +46,45 @@ frontend:
     replicas: 1
     resources:
       requests:
-        cpu: 50m
-        memory: 128Mi
+        cpu: 100m
+        memory: 512Mi
       limits:
         cpu: 500m
-        memory: 512Mi
+        memory: 1Gi
 
 platformBackend:
   deployment:
     replicas: 1
     resources:
       requests:
-        cpu: 50m
-        memory: 128Mi
+        cpu: 100m
+        memory: 512Mi
       limits:
         cpu: 500m
-        memory: 512Mi
+        memory: 1Gi
 
 playground:
   deployment:
     replicas: 1
     resources:
       requests:
-        cpu: 50m
-        memory: 128Mi
+        cpu: 100m
+        memory: 512Mi
       limits:
         cpu: 500m
-        memory: 512Mi
+        memory: 1Gi
 
 queue:
   deployment:
     replicas: 1
     resources:
       requests:
-        cpu: 50m
-        memory: 128Mi
+        cpu: 200m
+        memory: 512Mi
       limits:
         cpu: 500m
-        memory: 512Mi
+        memory: 1Gi
 
-# =============================================================================
-# LANGGRAPH DEPLOYMENT COMPONENTS (for -ld flag)
-# NOTE: These components are for v0.12+ only. For v0.11 and earlier, these
-# settings will be ignored by Helm (no error, just won't apply).
-# v0.11 uses different component names/structure managed by langgraphPlatform.
-# =============================================================================
-
-ingestQueue:
-  deployment:
-    replicas: 1
-    resources:
-      requests:
-        cpu: 50m
-        memory: 128Mi
-      limits:
-        cpu: 500m
-        memory: 512Mi
-
-aceBackend:
-  deployment:
-    replicas: 1
-    resources:
-      requests:
-        cpu: 50m
-        memory: 128Mi
-      limits:
-        cpu: 500m
-        memory: 512Mi
-
-hostBackend:
-  deployment:
-    replicas: 1
-    resources:
-      requests:
-        cpu: 50m
-        memory: 128Mi
-      limits:
-        cpu: 500m
-        memory: 512Mi
-
-listener:
-  deployment:
-    replicas: 1
-    resources:
-      requests:
-        cpu: 50m
-        memory: 128Mi
-      limits:
-        cpu: 500m
-        memory: 512Mi
-
-operator:
-  deployment:
-    replicas: 1
-    resources:
-      requests:
-        cpu: 50m
-        memory: 128Mi
-      limits:
-        cpu: 500m
-        memory: 512Mi
 
 # =============================================================================
 # STATEFUL DATA SERVICES (require more memory than app services)
@@ -158,7 +99,7 @@ postgres:
     resources:
       requests:
         cpu: 100m
-        memory: 256Mi
+        memory: 512Mi
       limits:
         cpu: 1000m
         memory: 2Gi
@@ -166,14 +107,24 @@ postgres:
 redis:
   persistence:
     enabled: false
+  # LangSmith chart uses statefulSet for Redis
   statefulSet:
     resources:
       requests:
         cpu: 100m
-        memory: 128Mi
+        memory: 512Mi
       limits:
         cpu: 500m
         memory: 1Gi
+  # langgraph-cloud chart uses deployment for Redis (default: 1 CPU / 2Gi request)
+  deployment:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
 
 # ClickHouse is the most resource-intensive component
 # Official minimum is 16Gi
@@ -182,7 +133,70 @@ clickhouse:
     resources:
       requests:
         cpu: 200m
+        memory: 1Gi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+
+
+# =============================================================================
+# LANGGRAPH DEPLOYMENT COMPONENTS (for -ld flag)
+# NOTE: These components are for v0.12+ only. For v0.11 and earlier, these
+# settings will be ignored by Helm (no error, just won't apply).
+# v0.11 uses different component names/structure managed by langgraphPlatform.
+# =============================================================================
+
+ingestQueue:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+aceBackend:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
         memory: 256Mi
       limits:
-        cpu: 2000m
-        memory: 4Gi
+        cpu: 500m
+        memory: 512Mi
+
+hostBackend:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+listener:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+operator:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
