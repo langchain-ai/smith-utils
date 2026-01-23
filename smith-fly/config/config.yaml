@@ -107,7 +107,6 @@ postgres:
 redis:
   persistence:
     enabled: false
-  # LangSmith chart uses statefulSet for Redis
   statefulSet:
     resources:
       requests:
@@ -116,15 +115,6 @@ redis:
       limits:
         cpu: 500m
         memory: 1Gi
-  # langgraph-cloud chart uses deployment for Redis (default: 1 CPU / 2Gi request)
-  deployment:
-    resources:
-      requests:
-        cpu: 100m
-        memory: 256Mi
-      limits:
-        cpu: 500m
-        memory: 512Mi
 
 # ClickHouse is the most resource-intensive component
 # Official minimum is 16Gi

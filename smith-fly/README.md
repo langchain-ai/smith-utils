@@ -131,9 +131,6 @@ LangSmith:
   Version:  0.12.73
   Pods:     14/14 Running
 
-LangSmith Deployment:
-  Status:   Not Installed
-
 Ingress:   http://192.168.49.2.nip.io
 
 ==========================================================================
@@ -264,8 +261,7 @@ If `./smith-fly.sh down` fails:
 # Set your namespace
 NAMESPACE=$(hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-')
 
-# Uninstall Helm releases
-helm uninstall langsmith-deployment -n $NAMESPACE
+# Uninstall Helm release
 helm uninstall langsmith -n $NAMESPACE
 
 # Delete PVCs
@@ -372,14 +368,12 @@ smith-fly/
 └── config/
     ├── .env                # User configuration (license, email) - DO NOT COMMIT!
     ├── config.yaml         # Base Helm values
-    ├── ls_config.yaml      # Generated LangSmith config (temporary)
-    └── ld_config.yaml      # Generated LangSmith Deployment config (temporary)
+    └── ls_config.yaml      # Generated LangSmith config (temporary)
 ```
 
 **Important:** The `.gitignore` file is configured to exclude:
 - `config/.env` - Contains sensitive credentials
 - `config/ls_config.yaml` - Generated configuration with secrets
-- `config/ld_config.yaml` - Generated configuration with secrets
 
 ## TODO
 

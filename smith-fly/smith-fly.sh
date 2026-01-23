@@ -22,7 +22,6 @@ CONFIG_DIR="${SCRIPT_DIR}/config"
 ENV_FILE="${CONFIG_DIR}/.env"
 CONFIG_YAML="${CONFIG_DIR}/config.yaml"
 LS_CONFIG_YAML="${CONFIG_DIR}/ls_config.yaml"
-LD_CONFIG_YAML="${CONFIG_DIR}/ld_config.yaml"
 
 ACTION=""
 INSTALL_LS=false
@@ -798,134 +797,6 @@ get_ingress_hostname() {
 }
 
 ##############################################################################
-# Function: create_langsmith_deployment_config
-# Description: Creates LangSmith Deployment configuration file
-##############################################################################
-create_langsmith_deployment_config() {
-    log INFO "Creating LangSmith Deployment configuration file..."
-    
-    # Copy LangSmith config to reuse same secrets
-    if [ ! -f "$LS_CONFIG_YAML" ]; then
-        log ERROR "LangSmith configuration not found: ${LS_CONFIG_YAML}"
-        exit 1
-    fi
-    
-    cp "$LS_CONFIG_YAML" "$LD_CONFIG_YAML"
-    
-    # Escape special characters for sed
-    escaped_license=$(printf '%s\n' "$LicenseKey" | sed 's/[\/&]/\\&/g')
-    escaped_namespace=$(printf '%s\n' "$NAMESPACE" | sed 's/[\/&]/\\&/g')
-    
-    if [ "$IS_V12_PLUS" = true ]; then
-        # v12+ configuration for langgraph-cloud chart
-        # NOTE: config.deployment.enabled is for LangSmith chart, NOT langgraph-cloud chart
-        # The langgraph-cloud chart uses: config.langGraphCloudLicenseKey, apiServer, studio, etc.
-        log INFO "Generating v12+ LangSmith Deployment configuration (langgraph-cloud chart)"
-        
-        # Add operator section for v12+
-        # Only skip CRD creation if CRD already exists (shared cluster scenario)
-        local create_crds="true"
-        if kubectl get crd lgps.apps.langchain.ai &> /dev/null; then
-            log INFO "CRD lgps.apps.langchain.ai already exists, skipping CRD creation in LD config"
-            create_crds="false"
-        fi
-        
-        if ! grep -q "^operator:" "$LD_CONFIG_YAML"; then
-            cat >> "$LD_CONFIG_YAML" << EOF
-
-operator:
-  createCRDs: ${create_crds}
-  watchNamespaces: "${NAMESPACE}"
-EOF
-        fi
-    else
-        # Pre-v12 configuration: use config.langgraphPlatform
-        log INFO "Generating pre-v12 LangSmith Deployment configuration"
-        
-        # Add LangSmith Deployment configuration under config section
-        if ! grep -q "^config:" "$LD_CONFIG_YAML"; then
-            # Add config section with langgraphPlatform
-            cat >> "$LD_CONFIG_YAML" << EOF
-
-config:
-  langgraphPlatform:
-    enabled: true
-    langgraphPlatformLicenseKey: "${LicenseKey}"
-EOF
-        else
-            # Config section exists, check if langgraphPlatform exists
-            if ! grep -q "langgraphPlatform:" "$LD_CONFIG_YAML"; then
-                # Add langgraphPlatform under config section using temp file
-                local temp_insert=$(mktemp)
-                cat > "$temp_insert" << EOF
-  langgraphPlatform:
-    enabled: true
-    langgraphPlatformLicenseKey: "${LicenseKey}"
-EOF
-                $SED_CMD -i.bak "/^config:/r $temp_insert" "$LD_CONFIG_YAML"
-                rm -f "$temp_insert" "${LD_CONFIG_YAML}.bak"
-            else
-                # Update existing langgraphPlatform section
-                $SED_CMD -i.bak \
-                    -e "/langgraphPlatform:/,/enabled:/ s/enabled:.*/enabled: true/" \
-                    -e "/langgraphPlatform:/,/langgraphPlatformLicenseKey:/ s/langgraphPlatformLicenseKey:.*/langgraphPlatformLicenseKey: \"${escaped_license}\"/" \
-                    "$LD_CONFIG_YAML"
-                rm -f "${LD_CONFIG_YAML}.bak"
-            fi
-        fi
-    fi
-    
-    # Disable ingress for LangGraph Cloud to avoid conflict with LangSmith ingress
-    # This applies to both ALB and nginx ingress types since LangSmith already
-    # provides the main ingress and LangGraph Cloud services are accessed via
-    # LoadBalancer services or through internal cluster routing
-    log INFO "Disabling ingress for LangGraph Cloud (using LangSmith ingress instead)"
-    if grep -q "^ingress:" "$LD_CONFIG_YAML"; then
-        $SED_CMD -i.bak \
-            -e "/^ingress:/,/^[a-zA-Z]/ { /enabled:/ s/enabled:.*/enabled: false/ }" \
-            "$LD_CONFIG_YAML"
-        rm -f "${LD_CONFIG_YAML}.bak"
-    else
-        # Add ingress section with disabled state
-        cat >> "$LD_CONFIG_YAML" << EOF
-
-ingress:
-  enabled: false
-EOF
-    fi
-    
-    # Add LangGraph Cloud license key (uses same license as LangSmith)
-    # Reference: https://github.com/langchain-ai/helm/blob/main/charts/langgraph-cloud/values.yaml
-    log INFO "Adding LangGraph Cloud license key configuration"
-    escaped_license=$(printf '%s\n' "$LicenseKey" | sed 's/[\/&]/\\&/g')
-    if grep -q "^config:" "$LD_CONFIG_YAML"; then
-        # Add langGraphCloudLicenseKey under config section (note: capital G in Graph per official chart)
-        $SED_CMD -i.bak "/^config:/a\\  langGraphCloudLicenseKey: \"${escaped_license}\"" "$LD_CONFIG_YAML"
-        rm -f "${LD_CONFIG_YAML}.bak"
-    fi
-    
-    # For nginx ingress (non-cloud environments like Minikube), use ClusterIP services
-    # instead of LoadBalancer since LoadBalancer won't get external IPs without a tunnel
-    if [ "$INGRESS_TYPE" = "nginx" ]; then
-        log INFO "Configuring LangGraph Cloud services for nginx ingress (ClusterIP)"
-        cat >> "$LD_CONFIG_YAML" << EOF
-
-# LangGraph Cloud API Server service configuration (ClusterIP for nginx ingress)
-apiServer:
-  service:
-    type: ClusterIP
-
-# LangGraph Cloud Studio service configuration (ClusterIP for nginx ingress)
-studio:
-  service:
-    type: ClusterIP
-EOF
-    fi
-    
-    log SUCCESS "LangSmith Deployment configuration file created: ${LD_CONFIG_YAML}"
-}
-
-##############################################################################
 # Function: check_langsmith_installed
 # Description: Checks if LangSmith is already installed
 ##############################################################################
@@ -940,7 +811,7 @@ check_langsmith_installed() {
 ##############################################################################
 # Function: get_helm_release_info
 # Description: Gets helm release information for a given release name
-# Arguments: $1 - release name (e.g., langsmith, langsmith-deployment)
+# Arguments: $1 - release name (e.g., langsmith)
 # Returns: version and status via global variables
 ##############################################################################
 get_helm_release_info() {
@@ -1005,7 +876,7 @@ get_pod_status_summary() {
 
 ##############################################################################
 # Function: show_status
-# Description: Displays installation status of LangSmith and LangSmith Deployment
+# Description: Displays installation status of LangSmith
 ##############################################################################
 show_status() {
     echo ""
@@ -1045,35 +916,6 @@ show_status() {
     fi
     echo ""
     
-    # Check LangSmith Deployment status
-    echo -e "${BLUE}LangSmith Deployment:${NC}"
-    local ld_info
-    ld_info=$(get_helm_release_info "langsmith-deployment")
-    
-    # Extract fields first to check if we have valid data
-    local ld_status ld_chart ld_app
-    ld_status=$(echo "$ld_info" | cut -d'|' -f1)
-    ld_chart=$(echo "$ld_info" | cut -d'|' -f2)
-    ld_app=$(echo "$ld_info" | cut -d'|' -f3)
-    
-    if [ -z "$ld_info" ] || [ "$ld_info" = "not_installed" ] || [ -z "$ld_status" ] || [ "$ld_status" = "not_installed" ]; then
-        echo -e "  Status:   ${YELLOW}Not Installed${NC}"
-    else
-        if [ "$ld_status" = "deployed" ]; then
-            echo -e "  Status:   ${GREEN}Installed${NC}"
-        else
-            echo -e "  Status:   ${YELLOW}${ld_status}${NC}"
-        fi
-        echo -e "  Chart:    ${ld_chart}"
-        [ -n "$ld_app" ] && echo -e "  Version:  ${ld_app}"
-        
-        # Get pod status
-        local pod_status
-        pod_status=$(get_pod_status_summary "app.kubernetes.io/instance=langsmith-deployment")
-        echo -e "  Pods:     ${pod_status}"
-    fi
-    echo ""
-    
     # Check ingress endpoint
     local endpoint=""
     endpoint=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
@@ -1101,7 +943,6 @@ install_langsmith_deployment() {
     log INFO "Installing LangSmith Deployment..."
     
     # For v12+, LangSmith needs config.deployment.enabled=true to show Deployments UI
-    # This must be set in the LangSmith chart, not the langgraph-cloud chart
     if [ "$IS_V12_PLUS" = true ]; then
         log INFO "Enabling deployment feature in LangSmith (v12+)..."
         
@@ -1154,6 +995,12 @@ EOF
         helm_cmd+=" --wait --timeout 30m"
         helm_cmd+=" --hide-notes"
         
+        # Add version if specified (important: preserve version when upgrading for deployment)
+        if [ -n "$VERSION" ]; then
+            helm_cmd+=" --version ${VERSION}"
+            log INFO "Using LangSmith version: ${VERSION}"
+        fi
+        
         # Only skip CRD creation if CRD already exists (shared cluster scenario)
         # This prevents "invalid ownership metadata" errors in shared clusters
         if kubectl get crd lgps.apps.langchain.ai &> /dev/null; then
@@ -1179,42 +1026,62 @@ EOF
         eval "$helm_cmd"
         log SUCCESS "LangSmith upgraded with deployment feature enabled"
     else
-        # Pre-v12: just check if LangSmith is installed
-        if ! check_langsmith_installed; then
-            log WARNING "LangSmith is not installed. Installing LangSmith first..."
-            install_langsmith
-        else
-            log INFO "LangSmith is already installed"
+        # Pre-v12: Enable langgraphPlatform feature
+        log INFO "Enabling langgraphPlatform feature in LangSmith (pre-v12)..."
+        
+        # Create/update LangSmith config
+        create_langsmith_config
+        
+        # Add langgraphPlatform.enabled to ls_config.yaml for pre-v12
+        local temp_insert=$(mktemp)
+        log INFO "Adding config.langgraphPlatform.enabled to LangSmith config"
+        cat > "$temp_insert" << EOF
+  langgraphPlatform:
+    enabled: true
+EOF
+        $SED_CMD -i.bak "/^config:/r $temp_insert" "$LS_CONFIG_YAML"
+        rm -f "$temp_insert" "${LS_CONFIG_YAML}.bak"
+        
+        # Run helm upgrade with the config
+        log INFO "Upgrading LangSmith with langgraphPlatform feature enabled..."
+        local helm_cmd="helm upgrade --install langsmith langchain/langsmith"
+        helm_cmd+=" --namespace \"${NAMESPACE}\""
+        helm_cmd+=" --values \"${LS_CONFIG_YAML}\""
+        helm_cmd+=" --wait --timeout 30m"
+        helm_cmd+=" --hide-notes"
+        
+        # Add version if specified
+        if [ -n "$VERSION" ]; then
+            helm_cmd+=" --version ${VERSION}"
+            log INFO "Using LangSmith version: ${VERSION}"
         fi
+        
+        # Only skip CRD creation if CRD already exists (shared cluster scenario)
+        if kubectl get crd lgps.apps.langchain.ai &> /dev/null; then
+            log INFO "CRD lgps.apps.langchain.ai already exists, skipping CRD creation"
+            helm_cmd+=" --set operator.createCRDs=false"
+        fi
+        
+        # Check if KEDA is installed - disable if not available
+        if ! is_keda_installed; then
+            log INFO "KEDA not installed, disabling KEDA integration for operator"
+            helm_cmd+=" --set operator.kedaEnabled=false"
+        fi
+        
+        if [ "$INGRESS_TYPE" = "nginx" ] || [ "$INGRESS_TYPE" = "alb" ]; then
+            helm_cmd+=" --set frontend.service.type=ClusterIP"
+        fi
+        
+        if [ "$DEBUG" = true ]; then
+            helm_cmd+=" --debug"
+        fi
+        
+        log INFO "Executing: ${helm_cmd}"
+        eval "$helm_cmd"
+        log SUCCESS "LangSmith upgraded with langgraphPlatform feature enabled"
     fi
     
-    # Create LangSmith Deployment configuration
-    create_langsmith_deployment_config
-    
-    # Build helm command (quote paths to handle spaces in directory names)
-    local helm_cmd="helm upgrade --install langsmith-deployment langchain/langgraph-cloud"
-    helm_cmd+=" --namespace \"${NAMESPACE}\""
-    helm_cmd+=" --values \"${LD_CONFIG_YAML}\""
-    helm_cmd+=" --wait --timeout 30m"
-    
-    # Add version if specified
-    if [ -n "$VERSION" ]; then
-        helm_cmd+=" --version ${VERSION}"
-        log INFO "Installing LangSmith Deployment version: ${VERSION}"
-    fi
-    
-    # Add debug flag if enabled
-    if [ "$DEBUG" = true ]; then
-        helm_cmd+=" --debug"
-        log INFO "Debug mode enabled"
-    fi
-    
-    log INFO "Executing: ${helm_cmd}"
-    
-    # Execute helm install
-    eval "$helm_cmd"
-    
-    log SUCCESS "LangSmith Deployment installed successfully"
+    log SUCCESS "LangSmith Deployment feature enabled successfully"
 }
 
 ##############################################################################
@@ -1359,10 +1226,6 @@ uninstall_all() {
         return 0
     fi
     
-    # Uninstall LangSmith Deployment
-    log INFO "Uninstalling LangSmith Deployment..."
-    helm uninstall langsmith-deployment -n "$NAMESPACE" 2>/dev/null || log WARNING "LangSmith Deployment not found or already uninstalled"
-    
     # Uninstall LangSmith
     log INFO "Uninstalling LangSmith..."
     helm uninstall langsmith -n "$NAMESPACE" 2>/dev/null || log WARNING "LangSmith not found or already uninstalled"
@@ -1377,7 +1240,6 @@ uninstall_all() {
         data-langsmith-clickhouse-0 \
         data-langsmith-postgres-0 \
         data-langsmith-redis-0 \
-        data-langsmith-deployment-postgres-0 \
         -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
     
     # Delete namespace
@@ -1387,7 +1249,6 @@ uninstall_all() {
     # Remove configuration files
     log INFO "Removing configuration files..."
     [ -f "$LS_CONFIG_YAML" ] && rm -f "$LS_CONFIG_YAML" && log INFO "Removed ${LS_CONFIG_YAML}"
-    [ -f "$LD_CONFIG_YAML" ] && rm -f "$LD_CONFIG_YAML" && log INFO "Removed ${LD_CONFIG_YAML}"
     
     log SUCCESS "Uninstallation completed successfully"
 }
