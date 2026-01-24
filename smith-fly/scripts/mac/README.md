@@ -1,6 +1,4 @@
-# macOS Scripts
-
-## minikube.sh
+# minikube.sh
 
 Smart Minikube starter script that automatically detects system resources and allocates optimal memory/CPU to Minikube.
 
