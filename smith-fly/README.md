@@ -29,8 +29,8 @@ Key capabilities:
 ### Kubernetes Cluster
 
 - A running Kubernetes cluster with:
-  - **CPU**: ~20 cores available
-  - **Memory**: ~50Gi available
+  - **CPU**: ~4 cores available
+  - **Memory**: ~8Gi available
   - Ingress controller configured:
     - **AWS EKS**: ALB Ingress Controller (auto-detected)
     - **Non-AWS**: nginx-ingress controller (auto-detected)
