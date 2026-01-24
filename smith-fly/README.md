@@ -275,11 +275,6 @@ kubectl delete namespace $NAMESPACE
 
 ## Resource Usage
 
-⚠️ **WARNING**: Default installation requires significant resources:
-
-- **CPU**: ~20 cores
-- **Memory**: ~50Gi
-
 ### Minimal Resource Configuration
 
 For local development or resource-constrained environments (e.g., Minikube), a minimal configuration with reduced resource limits is available in `config/config.yaml`. This sets memory limits for all components to work within ~16Gi total memory.
