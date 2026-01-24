@@ -42,6 +42,8 @@ Key capabilities:
 ```
 initialOrgAdminEmail="admin@example.com"
 LicenseKey="your-license-key-here"
+# Optional: Custom hostname for LangSmith (leave empty for auto-detection)
+# LANGSMITH_HOSTNAME="langsmith.example.com"
 ```
 **Note:** The `.env` file should not be committed to version control. Add it to `.gitignore` to keep sensitive information secure.
 
