@@ -273,10 +273,14 @@ kubectl delete namespace $NAMESPACE
 
 ## Resource Usage
 
-⚠️ **WARNING**: This installation requires significant resources:
+⚠️ **WARNING**: Default installation requires significant resources:
 
 - **CPU**: ~20 cores
 - **Memory**: ~50Gi
+
+### Minimal Resource Configuration
+
+For local development or resource-constrained environments (e.g., Minikube), a minimal configuration with reduced resource limits is available in `config/config.yaml`. This sets memory limits for all components to work within ~16Gi total memory.
 
 ### Replica Configuration
 
@@ -302,6 +306,7 @@ frontend:
 - AWS (EKS)
 - Google Cloud (GKE)
 - Azure (AKS)
+- Minikube (with automatic port-forward and localhost endpoint)
 - On-premise Kubernetes
 - Any Kubernetes distribution (k3s, microk8s, etc.)
 
@@ -316,7 +321,8 @@ The script **auto-detects** the cluster type and configures the appropriate ingr
 | Cluster Type | Ingress Type | Auto-Detection |
 |--------------|--------------|----------------|
 | **AWS EKS** | ALB | Detected via `eks.amazonaws.com` labels or `aws://` provider ID |
-| **Other clusters** | nginx | Default for GKE, AKS, on-premise, k3s, minikube, etc. |
+| **Minikube** | nginx | Auto port-forward to localhost, KEDA CRDs auto-detected |
+| **Other clusters** | nginx | Default for GKE, AKS, on-premise, k3s, etc. |
 
 Use the `-i` flag to override auto-detection if needed:
 
@@ -362,13 +368,16 @@ The script automatically detects ingress endpoints using both hostname (AWS) and
 
 ```
 smith-fly/
-├── smith-fly.sh        # Main installation script
+├── smith-fly.sh            # Main installation script
 ├── README.md               # This file
 ├── .gitignore              # Git ignore file (excludes .env and generated configs)
-└── config/
-    ├── .env                # User configuration (license, email) - DO NOT COMMIT!
-    ├── config.yaml         # Base Helm values
-    └── ls_config.yaml      # Generated LangSmith config (temporary)
+├── config/
+│   ├── .env                # User configuration (license, email) - DO NOT COMMIT!
+│   ├── config.yaml         # Base Helm values (includes minimal resource config)
+│   └── ls_config.yaml      # Generated LangSmith config (temporary)
+└── scripts/
+    └── mac/
+        └── minikube.sh     # macOS Minikube starter with auto resource detection
 ```
 
 **Important:** The `.gitignore` file is configured to exclude:
@@ -385,6 +394,8 @@ smith-fly/
 - [x] Configure replicas in `config.yaml` (default: 1 per component)
 - [x] Support shared clusters (automatic CRD conflict handling)
 - [x] Preserve secrets when upgrading LangSmith to LangSmith Deployment
+- [x] Minikube support with auto port-forward and KEDA detection
+- [x] Minimal resource configuration for local development
 - [ ] Support external database configuration
 - [ ] Add metrics collection integration
 - [ ] Support air-gapped installations
