@@ -11,10 +11,11 @@ This script automates the deployment of LangSmith and LangSmith Deployment to Ku
 Key capabilities:
 - Configuration generation with secure secrets
 - Helm chart installation and upgrades
-- Namespace management
+- Custom namespace support (`-n` flag) with DNS label validation
+- Auto-generated namespace from hostname when `-n` is not specified
 - Credential management
 - Installation status checking
-- Clean uninstallation for resource cleanup
+- Clean uninstallation for resource cleanup (single namespace or all at once)
 - LangSmith Deployments UI enabled by default (shows in LangSmith menu)
 - Shared cluster support (multiple installations without CRD conflicts)
 
@@ -74,9 +75,13 @@ config:
 ```bash
 # Check installation status
 ./smith-fly.sh status
+./smith-fly.sh status -n my-namespace    # Check status in a specific namespace
 
 # Install LangSmith (ingress type auto-detected based on cluster)
 ./smith-fly.sh up -l
+
+# Install LangSmith in a custom namespace
+./smith-fly.sh up -l -n my-namespace
 
 # Install LangSmith with ALB ingress (override auto-detect for AWS EKS)
 ./smith-fly.sh up -l -i alb
@@ -96,27 +101,33 @@ config:
 # Install LangSmith Deployment with specific ingress (override auto-detect)
 ./smith-fly.sh up -ld -i nginx
 
-# Uninstall everything
+# Uninstall LangSmith from ALL namespaces (auto-discovers deployments)
 ./smith-fly.sh down
+
+# Uninstall LangSmith from a specific namespace only
+./smith-fly.sh down -n my-namespace
 ```
 
 ### Command Options
 
 ```
-Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [-i INGRESS] [--debug]
+Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
 
 Actions:
     up      Spin up/install LangSmith or LangSmith Deployment
-    down    Delete both LangSmith and LangSmith Deployment
+    down    Remove LangSmith from all namespaces (or a specific one with -n)
     status  Check installation status of LangSmith and LangSmith Deployment
 
-Options (for 'up' action):
+Options:
     -l        Install LangSmith
     -ld       Install LangSmith Deployment
     -v        Specify version (optional)
+    -n        Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i        Ingress type: alb or nginx (auto-detected if not specified)
     --debug   Enable Helm debug output (optional)
 ```
+
+> **Namespace rules**: The `-n` value must start with a lowercase letter (`a-z`), contain only lowercase alphanumeric characters or hyphens, and be at most 63 characters. Purely numeric namespaces (e.g., `15265`) are rejected because they cause Helm YAML serialization errors. Use a prefixed name instead (e.g., `ls-15265`).
 
 ### Status Output Example
 
@@ -125,7 +136,7 @@ Options (for 'up' action):
 LangSmith Installation Status
 ==========================================================================
 
-Namespace: my-hostname
+Namespace: my-namespace
 
 LangSmith:
   Status:   Installed
@@ -250,17 +261,23 @@ kubectl logs -l app.kubernetes.io/name=redis -n <namespace>
 
 ### Get Namespace Name
 
-The script auto-generates namespace from your hostname:
+By default, the script auto-generates a namespace from your hostname. You can override this with the `-n` flag:
 ```bash
-# Get your namespace
+# See the auto-generated namespace
 hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-'
+
+# Or use a custom namespace
+./smith-fly.sh status -n my-namespace
 ```
 
 ### Manual Cleanup
 
 If `./smith-fly.sh down` fails:
 ```bash
-# Set your namespace
+# Option 1: Remove from a specific namespace
+NAMESPACE="my-namespace"
+
+# Option 2: Use auto-generated namespace
 NAMESPACE=$(hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-')
 
 # Uninstall Helm release
@@ -271,6 +288,11 @@ kubectl delete pvc --all -n $NAMESPACE
 
 # Delete namespace
 kubectl delete namespace $NAMESPACE
+```
+
+To find all namespaces with LangSmith deployments:
+```bash
+helm list --all-namespaces --filter '^langsmith$'
 ```
 
 ## Resource Usage
@@ -309,7 +331,19 @@ frontend:
 
 ### Shared Cluster Support
 
-The script supports deploying multiple LangSmith installations in different namespaces on the same cluster. It automatically skips CRD creation (`operator.createCRDs=false`) to avoid Helm ownership conflicts when CRDs are already present from another installation.
+The script supports deploying multiple LangSmith installations in different namespaces on the same cluster using the `-n` flag. It automatically skips CRD creation (`operator.createCRDs=false`) to avoid Helm ownership conflicts when CRDs are already present from another installation.
+
+```bash
+# Deploy to multiple namespaces on the same cluster
+./smith-fly.sh up -l -n team-alpha
+./smith-fly.sh up -l -n team-beta
+
+# Tear down all deployments at once
+./smith-fly.sh down
+
+# Or tear down a specific namespace
+./smith-fly.sh down -n team-alpha
+```
 
 ### Ingress Configuration
 
@@ -384,7 +418,8 @@ smith-fly/
 ## TODO
 
 - [ ] Support TLS/SSL for ingress
-- [ ] Support custom namespace names
+- [x] Support custom namespace names (via `-n` flag with DNS label validation)
+- [x] Multi-namespace teardown (`down` auto-discovers all LangSmith deployments)
 - [x] Add installation status check (`status` action)
 - [x] Support multiple ingress types (ALB/nginx via `-i` flag)
 - [x] Auto-detect cluster type for ingress (EKS -> ALB, others -> nginx)
