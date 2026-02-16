@@ -6,7 +6,7 @@
 # Description: Automates the installation and management of LangSmith and 
 #              LangSmith Deployment on any Kubernetes cluster (cross-platform)
 # 
-# Usage: ./smith-fly.sh <up|down> <-l|-ld> [-v VERSION]
+# Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [-n NAMESPACE]
 # 
 # Date: 2025-10-14
 ##############################################################################
@@ -295,22 +295,24 @@ set_ingress_type() {
 ##############################################################################
 show_usage() {
     cat << EOF
-Usage: $0 <up|down> [-l|-ld] [-v VERSION] [--debug]
+Usage: $0 <up|down|status> [-l|-ld] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
 
 Actions:
     up      Spin up/install LangSmith or LangSmith Deployment
-    down    Delete both LangSmith and LangSmith Deployment from your installation
+    down    Remove LangSmith from all namespaces (or a specific one with -n)
     status  Check installation status of LangSmith and LangSmith Deployment
 
 Options (for 'up' action):
     -l      Install LangSmith
     -ld     Install LangSmith Deployment
     -v      Specify version (optional)
+    -n      Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i      Ingress type: alb or nginx (auto-detected if not specified)
     --debug Enable Helm debug output (optional)
 
 Examples:
     $0 up -l                     # Install LangSmith (ingress auto-detected based on cluster)
+    $0 up -l -n my-namespace     # Install LangSmith in custom namespace
     $0 up -l -i alb              # Install LangSmith with ALB ingress (override auto-detect)
     $0 up -l -i nginx            # Install LangSmith with nginx ingress (override auto-detect)
     $0 up -l -v 0.12.3           # Install LangSmith v12+ with specific version
@@ -319,15 +321,17 @@ Examples:
     $0 up -ld                    # Install LangSmith Deployment (automatically installs LangSmith if not present)
     $0 up -ld -i nginx           # Install LangSmith Deployment with nginx ingress
     $0 up -ld -v 0.11.0          # Install LangSmith Deployment with pre-v12 config format
-    $0 down                      # Remove both LangSmith and LangSmith Deployment
+    $0 down                      # Remove LangSmith from ALL namespaces (auto-discovers deployments)
+    $0 down -n my-namespace      # Remove LangSmith from a specific namespace only
     $0 status                    # Check installation status of LangSmith and LangSmith Deployment
+    $0 status -n my-namespace    # Check status in a custom namespace
 
 Notes:
     - At least one of -l or -ld must be specified with "up"
     - When installing LangSmith Deployment (-ld), LangSmith is automatically installed if not already present
-    - The "down" action removes both LangSmith and LangSmith Deployment
+    - The "down" action removes LangSmith from all namespaces (or a specific one with -n)
     - Configuration is read from ${ENV_FILE}
-    - Namespace is auto-generated from your local machine hostname
+    - Namespace is auto-generated from hostname unless overridden with -n
     - Version >= 0.12.0 uses new config format (config.deployment, config.hostname)
     - Version < 0.12.0 uses legacy config format (config.langgraphPlatform, langgraphPlatformLicenseKey)
     - Ingress type is auto-detected: AWS EKS -> ALB, other clusters -> nginx
@@ -416,6 +420,17 @@ parse_arguments() {
             --debug)
                 DEBUG=true
                 shift
+                ;;
+            -n)
+                if [ $# -lt 2 ]; then
+                    log ERROR "-n option requires a namespace argument"
+                    show_usage
+                fi
+                NAMESPACE="$2"
+                if ! validate_namespace "$NAMESPACE"; then
+                    show_usage
+                fi
+                shift 2
                 ;;
             -i)
                 if [ $# -lt 2 ]; then
@@ -511,15 +526,72 @@ load_configuration() {
 }
 
 ##############################################################################
+# Function: validate_namespace
+# Description: Validates that namespace conforms to Kubernetes DNS label rules
+#              and does not start with a digit (avoids Helm YAML number coercion)
+# Arguments:  $1 - namespace string to validate
+# Returns:    0 on success, exits with error on failure
+##############################################################################
+validate_namespace() {
+    local ns="$1"
+
+    # Must not be empty
+    if [ -z "$ns" ]; then
+        log ERROR "Namespace cannot be empty"
+        return 1
+    fi
+
+    # Max 63 characters (RFC 1123 DNS label)
+    if [ "${#ns}" -gt 63 ]; then
+        log ERROR "Namespace '${ns}' exceeds 63 characters (got ${#ns})"
+        return 1
+    fi
+
+    # Must start with a lowercase letter (a-z).
+    # Purely numeric namespaces cause Helm YAML serialization to treat the
+    # value as an integer, which breaks metadata.namespace (expects a string).
+    if [[ ! "$ns" =~ ^[a-z] ]]; then
+        log ERROR "Namespace '${ns}' must start with a lowercase letter (a-z)"
+        log ERROR "Purely numeric or digit-leading namespaces break Helm YAML serialization"
+        log INFO  "Hint: prefix with a string, e.g. 'ls-${ns}'"
+        return 1
+    fi
+
+    # Must consist only of lowercase alphanumeric characters or hyphens
+    if [[ ! "$ns" =~ ^[a-z][a-z0-9-]*$ ]]; then
+        log ERROR "Namespace '${ns}' contains invalid characters"
+        log ERROR "Only lowercase letters, digits, and hyphens are allowed"
+        return 1
+    fi
+
+    # Must not end with a hyphen
+    if [[ "$ns" =~ -$ ]]; then
+        log ERROR "Namespace '${ns}' must not end with a hyphen"
+        return 1
+    fi
+
+    return 0
+}
+
+##############################################################################
 # Function: setup_namespace
 # Description: Creates namespace based on hostname
 ##############################################################################
 setup_namespace() {
     log INFO "Setting up namespace..."
     
-    # Generate namespace from hostname
-    NAMESPACE=$(hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+    # Use custom namespace if provided via -n, otherwise generate from hostname
+    if [ -z "$NAMESPACE" ]; then
+        NAMESPACE=$(hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+        # Strip leading digits/hyphens from auto-generated namespace
+        NAMESPACE=$(echo "$NAMESPACE" | sed 's/^[^a-z]*//')
+    fi
     
+    # Validate namespace before proceeding
+    if ! validate_namespace "$NAMESPACE"; then
+        exit 1
+    fi
+
     log INFO "Using namespace: ${NAMESPACE}"
     
     # Create namespace if it doesn't exist
@@ -1208,49 +1280,120 @@ EOF
 }
 
 ##############################################################################
+# Function: uninstall_from_namespace
+# Description: Uninstalls LangSmith and LangSmith Deployment from a single namespace
+# Arguments:  $1 - namespace to uninstall from
+##############################################################################
+uninstall_from_namespace() {
+    local targetNs="$1"
+
+    log INFO "Uninstalling LangSmith from namespace: ${targetNs}..."
+
+    # Check if namespace exists
+    if ! kubectl get namespace "$targetNs" &> /dev/null; then
+        log WARNING "Namespace ${targetNs} does not exist. Skipping."
+        return 0
+    fi
+
+    # Uninstall LangSmith Helm release
+    log INFO "Uninstalling Helm release 'langsmith' in ${targetNs}..."
+    helm uninstall langsmith -n "$targetNs" 2>/dev/null || log WARNING "LangSmith not found or already uninstalled in ${targetNs}"
+
+    # List PVCs
+    log INFO "Listing Persistent Volume Claims in ${targetNs}..."
+    kubectl get pvc -n "$targetNs" 2>/dev/null || log INFO "No PVCs found in ${targetNs}"
+
+    # Delete PVCs
+    log INFO "Deleting Persistent Volume Claims in ${targetNs}..."
+    kubectl delete pvc \
+        data-langsmith-clickhouse-0 \
+        data-langsmith-postgres-0 \
+        data-langsmith-redis-0 \
+        -n "$targetNs" --ignore-not-found 2>/dev/null || true
+
+    # Delete namespace
+    log INFO "Deleting namespace: ${targetNs}"
+    kubectl delete namespace "$targetNs" --ignore-not-found
+
+    log SUCCESS "Uninstallation completed for namespace: ${targetNs}"
+}
+
+##############################################################################
+# Function: discover_langsmith_namespaces
+# Description: Finds all namespaces that have a 'langsmith' Helm release or
+#              langsmith pods. Results are deduplicated by the caller.
+# Output:     Prints matching namespace names (one per line) to stdout
+##############################################################################
+discover_langsmith_namespaces() {
+    # Method 1: Find namespaces with a Helm release named 'langsmith'
+    # Table output column 2 is NAMESPACE (skip header with NR>1)
+    helm list --all-namespaces --filter '^langsmith$' 2>/dev/null \
+        | awk 'NR>1 {print $2}' || true
+
+    # Method 2: Find namespaces that have langsmith pods
+    # Covers edge cases where Helm release was partially removed
+    kubectl get pods --all-namespaces -l 'app.kubernetes.io/name=langsmith' \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null || true
+}
+
+##############################################################################
 # Function: uninstall_all
-# Description: Uninstalls LangSmith and LangSmith Deployment
+# Description: Uninstalls LangSmith and LangSmith Deployment from one or all
+#              namespaces. When NAMESPACE is set (via -n), removes from that
+#              namespace only. Otherwise, discovers and removes from all
+#              namespaces that have a langsmith deployment.
 ##############################################################################
 uninstall_all() {
     log INFO "Starting uninstallation process for both LangSmith and LangSmith Deployment..."
-    
+
     # Stop port-forward if running on Minikube
     if is_minikube_cluster; then
         log INFO "Minikube cluster detected - stopping port-forward..."
         stop_minikube_port_forward
     fi
-    
-    # Check if namespace exists
-    if ! kubectl get namespace "$NAMESPACE" &> /dev/null; then
-        log WARNING "Namespace ${NAMESPACE} does not exist. Nothing to uninstall."
-        return 0
+
+    # Determine target namespaces
+    local namespaces=()
+
+    if [ -n "$NAMESPACE" ]; then
+        # User specified a namespace via -n
+        namespaces=("$NAMESPACE")
+    else
+        # Discover all namespaces with langsmith deployments
+        log INFO "No namespace specified — discovering all LangSmith deployments across the cluster..."
+        local discovered
+        discovered=$(discover_langsmith_namespaces | sort -u)
+
+        if [ -z "$discovered" ]; then
+            log WARNING "No LangSmith deployments found in any namespace. Nothing to uninstall."
+            return 0
+        fi
+
+        while IFS= read -r ns; do
+            [ -n "$ns" ] && namespaces+=("$ns")
+        done <<< "$discovered"
+
+        log INFO "Found LangSmith deployments in ${#namespaces[@]} namespace(s): ${namespaces[*]}"
     fi
-    
-    # Uninstall LangSmith
-    log INFO "Uninstalling LangSmith..."
-    helm uninstall langsmith -n "$NAMESPACE" 2>/dev/null || log WARNING "LangSmith not found or already uninstalled"
-    
-    # List PVCs
-    log INFO "Listing Persistent Volume Claims..."
-    kubectl get pvc -n "$NAMESPACE" 2>/dev/null || log INFO "No PVCs found"
-    
-    # Delete PVCs
-    log INFO "Deleting Persistent Volume Claims..."
-    kubectl delete pvc \
-        data-langsmith-clickhouse-0 \
-        data-langsmith-postgres-0 \
-        data-langsmith-redis-0 \
-        -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
-    
-    # Delete namespace
-    log INFO "Deleting namespace: ${NAMESPACE}"
-    kubectl delete namespace "$NAMESPACE" --ignore-not-found
-    
-    # Remove configuration files
-    log INFO "Removing configuration files..."
+
+    # Uninstall from each namespace
+    local failCount=0
+    for ns in "${namespaces[@]}"; do
+        if ! uninstall_from_namespace "$ns"; then
+            log WARNING "Failed to fully uninstall from namespace: ${ns}"
+            ((failCount++))
+        fi
+    done
+
+    # Remove local configuration files
+    log INFO "Removing local configuration files..."
     [ -f "$LS_CONFIG_YAML" ] && rm -f "$LS_CONFIG_YAML" && log INFO "Removed ${LS_CONFIG_YAML}"
-    
-    log SUCCESS "Uninstallation completed successfully"
+
+    if [ "$failCount" -gt 0 ]; then
+        log WARNING "Uninstallation completed with ${failCount} warning(s)"
+    else
+        log SUCCESS "Uninstallation completed successfully for all namespaces"
+    fi
 }
 
 ##############################################################################
@@ -1262,8 +1405,15 @@ main() {
     
     # For status action, only set namespace and show status (minimal output)
     if [ "$ACTION" = "status" ]; then
-        # Generate namespace from hostname (silent)
-        NAMESPACE=$(hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+        # Use custom namespace if provided via -n, otherwise generate from hostname
+        if [ -z "$NAMESPACE" ]; then
+            NAMESPACE=$(hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+            # Strip leading digits/hyphens from auto-generated namespace
+            NAMESPACE=$(echo "$NAMESPACE" | sed 's/^[^a-z]*//')
+        fi
+        if ! validate_namespace "$NAMESPACE"; then
+            exit 1
+        fi
         show_status
         return 0
     fi
@@ -1273,42 +1423,54 @@ main() {
     # Check prerequisites
     check_prerequisites
     
-    # Setup namespace
-    setup_namespace
-    
-    # Auto-detect ingress type based on cluster (EKS -> ALB, others -> nginx)
-    set_ingress_type
-    
-    # Load configuration
-    load_configuration
-    
-    # Setup Helm repository
-    setup_helm_repo
-    
-    # Execute action
-    case "$ACTION" in
-        up)
-            if [ "$INSTALL_LS" = true ]; then
-                install_langsmith
+    # For 'down' action, skip setup steps that are only needed for installation.
+    # uninstall_all handles namespace discovery internally.
+    if [ "$ACTION" = "down" ]; then
+        # If user specified -n, validate it before proceeding
+        if [ -n "$NAMESPACE" ]; then
+            if ! validate_namespace "$NAMESPACE"; then
+                exit 1
             fi
-            
-            if [ "$INSTALL_LD" = true ]; then
-                install_langsmith_deployment
-            fi
-            
-            # Display connection information after any installation
-            if [ "$INSTALL_LS" = true ] || [ "$INSTALL_LD" = true ]; then
-                display_langsmith_info
-            fi
-            ;;
-        down)
-            uninstall_all
-            ;;
-        *)
-            log ERROR "Unknown action: ${ACTION}"
-            exit 1
-            ;;
-    esac
+            log INFO "Will uninstall from namespace: ${NAMESPACE}"
+        else
+            log INFO "No namespace specified — will discover and remove all LangSmith deployments"
+        fi
+        uninstall_all
+    else
+        # Setup namespace (required for 'up')
+        setup_namespace
+        
+        # Auto-detect ingress type based on cluster (EKS -> ALB, others -> nginx)
+        set_ingress_type
+        
+        # Load configuration
+        load_configuration
+        
+        # Setup Helm repository
+        setup_helm_repo
+        
+        # Execute action
+        case "$ACTION" in
+            up)
+                if [ "$INSTALL_LS" = true ]; then
+                    install_langsmith
+                fi
+                
+                if [ "$INSTALL_LD" = true ]; then
+                    install_langsmith_deployment
+                fi
+                
+                # Display connection information after any installation
+                if [ "$INSTALL_LS" = true ] || [ "$INSTALL_LD" = true ]; then
+                    display_langsmith_info
+                fi
+                ;;
+            *)
+                log ERROR "Unknown action: ${ACTION}"
+                exit 1
+                ;;
+        esac
+    fi
     
     log SUCCESS "Script completed successfully"
 }
