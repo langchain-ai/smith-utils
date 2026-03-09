@@ -1032,8 +1032,9 @@ install_langsmith_deployment() {
         # Create/update LangSmith config with deployment enabled
         create_langsmith_config
         
-        # Determine hostname for deployment (required in v12+ when deployment is enabled)
-        # Priority: 1) User-specified LANGSMITH_HOSTNAME, 2) Existing ingress, 3) localhost fallback
+        # Determine hostname for deployment (required by chart validation in v12+)
+        # Priority: 1) User-specified LANGSMITH_HOSTNAME, 2) Existing ingress
+        # Fallback: ALB -> placeholder + post-patch to remove host rule, nginx/minikube -> localhost
         local ingress_hostname=""
         
         # Priority 1: User-specified hostname from .env
@@ -1052,14 +1053,20 @@ install_langsmith_deployment() {
             fi
         fi
         
-        # Priority 3: Fallback to localhost (works with port-forward)
+        # Priority 3: Fallback when no hostname is available
+        local alb_patch_host=false
         if [ -z "$ingress_hostname" ] || [ "$ingress_hostname" = "<pending-ingress-hostname>" ]; then
-            ingress_hostname="localhost"
-            log INFO "Using default hostname: localhost (use port-forward to access)"
+            if [ "$INGRESS_TYPE" = "alb" ]; then
+                ingress_hostname="langsmith.internal"
+                alb_patch_host=true
+                log INFO "No custom hostname for ALB - using placeholder (will patch ingress to accept all traffic)"
+            else
+                ingress_hostname="localhost"
+                log INFO "Using default hostname: localhost (use port-forward to access)"
+            fi
         fi
         
         # Add deployment section to ls_config.yaml for LangSmith chart
-        # Always include both deployment.enabled AND hostname (required in v12+)
         local temp_insert=$(mktemp)
         log INFO "Adding config.deployment.enabled and config.hostname to LangSmith config"
         cat > "$temp_insert" << EOF
@@ -1119,6 +1126,16 @@ EOF
         log INFO "Executing: ${helm_cmd}"
         eval "$helm_cmd"
         log SUCCESS "LangSmith upgraded with deployment feature enabled"
+        
+        # For ALB without a custom hostname, remove the host rule so ALB accepts
+        # all traffic instead of filtering by the placeholder hostname.
+        if [ "$alb_patch_host" = true ]; then
+            log INFO "Patching ingress to remove host rule (ALB will accept all traffic)..."
+            kubectl patch ingress langsmith-ingress -n "$NAMESPACE" --type=json \
+                -p='[{"op":"remove","path":"/spec/rules/0/host"}]' 2>/dev/null \
+                && log SUCCESS "Ingress patched - ALB will route all traffic" \
+                || log WARNING "Could not patch ingress host rule - ALB may require Host header matching"
+        fi
     else
         # Pre-v12: Enable langgraphPlatform feature
         log INFO "Enabling langgraphPlatform feature in LangSmith (pre-v12)..."
