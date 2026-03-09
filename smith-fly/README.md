@@ -27,6 +27,8 @@ Key capabilities:
 - **helm** - Kubernetes package manager (v3+)
 - **openssl** - For generating secure secrets
 
+Example of [Minikube script](https://github.com/langchain-ai/smith-utils/blob/main/smith-fly/scripts/mac/README.md) to quckly spin up k8s cluster.
+
 ### Kubernetes Cluster
 
 - A running Kubernetes cluster with:
