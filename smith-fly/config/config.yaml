@@ -181,6 +181,12 @@ listener:
         memory: 1Gi
 
 operator:
+  # watchNamespaces scopes the operator to specific namespace(s) using
+  # namespaced Role/RoleBinding instead of cluster-scoped ClusterRole.
+  # Avoids "invalid ownership metadata" conflicts on shared clusters where
+  # another release already owns the ClusterRole "langsmith-operator".
+  # Value is set dynamically by smith-fly.sh (defaults to release namespace).
+  watchNamespaces: ""
   deployment:
     replicas: 1
     resources:

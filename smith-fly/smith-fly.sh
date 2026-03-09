@@ -774,6 +774,12 @@ install_langsmith() {
     # Create configuration
     create_langsmith_config
     
+    # Scope operator to this namespace in the values file to ensure the chart
+    # renders namespaced Role/RoleBinding instead of cluster-scoped ClusterRole.
+    log INFO "Setting operator.watchNamespaces=${NAMESPACE} in values file"
+    $SED_CMD -i.bak "s/watchNamespaces:.*/watchNamespaces: \"${NAMESPACE}\"/" "$LS_CONFIG_YAML"
+    rm -f "${LS_CONFIG_YAML}.bak"
+    
     # Build helm command (quote paths to handle spaces in directory names)
     local helm_cmd="helm upgrade --install langsmith langchain/langsmith"
     helm_cmd+=" --namespace \"${NAMESPACE}\""
@@ -801,6 +807,11 @@ install_langsmith() {
         log INFO "CRD lgps.apps.langchain.ai already exists, skipping CRD creation"
         helm_cmd+=" --set operator.createCRDs=false"
     fi
+    
+    # Scope operator to this namespace to avoid ClusterRole ownership conflicts
+    # on shared clusters where another release already owns "langsmith-operator"
+    helm_cmd+=" --set operator.watchNamespaces=${NAMESPACE}"
+    log INFO "Scoping operator to namespace: ${NAMESPACE} (avoids ClusterRole conflicts)"
     
     # Check if KEDA is installed - disable if not available (typical for Minikube/local clusters)
     if ! is_keda_installed; then
@@ -1059,6 +1070,13 @@ EOF
         $SED_CMD -i.bak "/^config:/r $temp_insert" "$LS_CONFIG_YAML"
         rm -f "$temp_insert" "${LS_CONFIG_YAML}.bak"
         
+        # Scope operator to this namespace in the values file to ensure the chart
+        # renders namespaced Role/RoleBinding instead of cluster-scoped ClusterRole.
+        # Prevents "invalid ownership metadata" errors on shared clusters.
+        log INFO "Setting operator.watchNamespaces=${NAMESPACE} in values file"
+        $SED_CMD -i.bak "s/watchNamespaces:.*/watchNamespaces: \"${NAMESPACE}\"/" "$LS_CONFIG_YAML"
+        rm -f "${LS_CONFIG_YAML}.bak"
+        
         # Always upgrade LangSmith to ensure deployment is enabled
         log INFO "Upgrading LangSmith with deployment feature enabled..."
         local helm_cmd="helm upgrade --install langsmith langchain/langsmith"
@@ -1079,6 +1097,10 @@ EOF
             log INFO "CRD lgps.apps.langchain.ai already exists, skipping CRD creation"
             helm_cmd+=" --set operator.createCRDs=false"
         fi
+        
+        # Scope operator to this namespace to avoid ClusterRole ownership conflicts
+        helm_cmd+=" --set operator.watchNamespaces=${NAMESPACE}"
+        log INFO "Scoping operator to namespace: ${NAMESPACE} (avoids ClusterRole conflicts)"
         
         # Check if KEDA is installed - disable if not available (typical for Minikube/local clusters)
         if ! is_keda_installed; then
@@ -1103,6 +1125,11 @@ EOF
         
         # Create/update LangSmith config
         create_langsmith_config
+        
+        # Scope operator to this namespace in the values file
+        log INFO "Setting operator.watchNamespaces=${NAMESPACE} in values file"
+        $SED_CMD -i.bak "s/watchNamespaces:.*/watchNamespaces: \"${NAMESPACE}\"/" "$LS_CONFIG_YAML"
+        rm -f "${LS_CONFIG_YAML}.bak"
         
         # Add langgraphPlatform.enabled to ls_config.yaml for pre-v12
         local temp_insert=$(mktemp)
@@ -1133,6 +1160,10 @@ EOF
             log INFO "CRD lgps.apps.langchain.ai already exists, skipping CRD creation"
             helm_cmd+=" --set operator.createCRDs=false"
         fi
+        
+        # Scope operator to this namespace to avoid ClusterRole ownership conflicts
+        helm_cmd+=" --set operator.watchNamespaces=${NAMESPACE}"
+        log INFO "Scoping operator to namespace: ${NAMESPACE} (avoids ClusterRole conflicts)"
         
         # Check if KEDA is installed - disable if not available
         if ! is_keda_installed; then
