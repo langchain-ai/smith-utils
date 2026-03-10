@@ -190,3 +190,32 @@ operator:
       limits:
         cpu: 500m
         memory: 1Gi
+
+
+# =============================================================================
+# AGENT BUILDER COMPONENTS (for -lda flag, v0.13+)
+# Enables no-code agent creation directly in the LangSmith UI.
+# These are enabled dynamically by smith-fly.sh alongside deployment.
+# =============================================================================
+
+agentBuilderToolServer:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+agentBuilderTriggerServer:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
