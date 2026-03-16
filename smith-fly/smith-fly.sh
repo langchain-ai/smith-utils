@@ -27,6 +27,7 @@ ACTION=""
 INSTALL_LS=false
 INSTALL_LD=false
 INSTALL_AB=false  # Agent Builder (requires Deployment)
+OPERATOR_SCALED_DOWN=false  # Safety flag: true while operator is at 0 replicas during bootstrap
 VERSION=""
 DEBUG=false
 NAMESPACE=""
@@ -94,11 +95,15 @@ log() {
 ##############################################################################
 cleanup_on_error() {
     log ERROR "Script failed. Cleaning up temporary files..."
-    # Add any cleanup logic needed on error
+    if [ "$OPERATOR_SCALED_DOWN" = true ] && [ -n "$NAMESPACE" ]; then
+        log WARNING "Restoring operator to 1 replica after interruption..."
+        kubectl scale deployment langsmith-operator -n "$NAMESPACE" --replicas=1 2>/dev/null || true
+        OPERATOR_SCALED_DOWN=false
+    fi
 }
 
-# Set trap for error handling
-trap cleanup_on_error ERR
+# Set trap for error handling (ERR for failures, INT/TERM for Ctrl+C and kill)
+trap cleanup_on_error ERR INT TERM
 
 ##############################################################################
 # Function: is_version_v12_plus
@@ -1214,6 +1219,9 @@ wait_and_patch_lgp_resources() {
             log SUCCESS "Agent Builder bootstrap completed"
             # Final patch to ensure dev sizes stick
             kubectl patch lgp "$lgp_name" -n "$NAMESPACE" --type=merge -p "$lgp_patch" 2>/dev/null || true
+            log INFO "Scaling operator back to 1 replica..."
+            kubectl scale deployment langsmith-operator -n "$NAMESPACE" --replicas=1 2>/dev/null || true
+            OPERATOR_SCALED_DOWN=false
             return 0
         fi
 
@@ -1240,6 +1248,9 @@ wait_and_patch_lgp_resources() {
     done
 
     log WARNING "Bootstrap did not complete within ${bootstrap_max}s - it may still be running in the background"
+    log INFO "Scaling operator back to 1 replica..."
+    kubectl scale deployment langsmith-operator -n "$NAMESPACE" --replicas=1 2>/dev/null || true
+    OPERATOR_SCALED_DOWN=false
 }
 
 ##############################################################################
@@ -1527,6 +1538,14 @@ EOF
                     kubectl rollout status "deployment/${dep}" -n "$NAMESPACE" --timeout=300s 2>/dev/null || true
                 done
                 log SUCCESS "All core deployments ready"
+
+                # Scale operator to 0 before bootstrap to eliminate the race condition
+                # where the operator reconciles production-sized LGP defaults before
+                # wait_and_patch_lgp_resources can patch them down to dev sizes.
+                log INFO "Scaling operator to 0 replicas to prevent premature LGP reconciliation..."
+                OPERATOR_SCALED_DOWN=true
+                kubectl scale deployment langsmith-operator -n "$NAMESPACE" --replicas=0
+                kubectl rollout status deployment/langsmith-operator -n "$NAMESPACE" --timeout=60s 2>/dev/null || true
 
                 # Phase 2: Re-run helm with bootstrap enabled and --wait=false.
                 # The bootstrap job is a Helm post-upgrade hook with backoffLimit=0,
