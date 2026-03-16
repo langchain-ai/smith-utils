@@ -1,12 +1,12 @@
-# smith-fly - LangSmith & LangSmith Deployment Installer
+# smith-fly - LangSmith, LangSmith Deployment & Agent Builder Installer
 
-Automated installation and management tool for LangSmith and LangSmith Deployment on any Kubernetes cluster.
+Automated installation and management tool for LangSmith, LangSmith Deployment, and Agent Builder on any Kubernetes cluster.
 
 > ⚠️ **IMPORTANT**: This script is intended for **TEST PURPOSES ONLY**. It is designed for quick testing, development, and reproduction environments. Do not use this for production deployments.
 
 ## Purpose
 
-This script automates the deployment of LangSmith and LangSmith Deployment to Kubernetes clusters for **testing and development purposes**. It provides a quick way to spin up environments for reproduction, debugging, and evaluation across multiple cloud providers and on-premise environments.
+This script automates the deployment of LangSmith, LangSmith Deployment, and Agent Builder to Kubernetes clusters for **testing and development purposes**. It provides a quick way to spin up environments for reproduction, debugging, and evaluation across multiple cloud providers and on-premise environments.
 
 Key capabilities:
 - Configuration generation with secure secrets
@@ -18,6 +18,7 @@ Key capabilities:
 - Clean uninstallation for resource cleanup (single namespace or all at once)
 - LangSmith Deployments UI enabled by default (shows in LangSmith menu)
 - Shared cluster support (multiple installations without CRD conflicts)
+- Agent Builder support (`-lda` flag, chart v0.13+) with two-phase Minikube install
 
 ## Requirements
 
@@ -32,8 +33,8 @@ Example of [Minikube script](https://github.com/langchain-ai/smith-utils/blob/ma
 ### Kubernetes Cluster
 
 - A running Kubernetes cluster with:
-  - **CPU**: ~4 cores available
-  - **Memory**: ~8Gi available
+  - **CPU**: ~4 cores available (~10 cores for `-lda`)
+  - **Memory**: ~8Gi available (~12Gi for `-lda`)
   - Ingress controller configured:
     - **AWS EKS**: ALB Ingress Controller (auto-detected)
     - **Non-AWS**: nginx-ingress controller (auto-detected)
@@ -103,6 +104,9 @@ config:
 # Install LangSmith Deployment with specific ingress (override auto-detect)
 ./smith-fly.sh up -ld -i nginx
 
+# Install LangSmith Deployment + Agent Builder (requires chart v0.13+)
+./smith-fly.sh up -lda
+
 # Uninstall LangSmith from ALL namespaces (auto-discovers deployments)
 ./smith-fly.sh down
 
@@ -113,16 +117,17 @@ config:
 ### Command Options
 
 ```
-Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
+Usage: ./smith-fly.sh <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
 
 Actions:
-    up      Spin up/install LangSmith or LangSmith Deployment
+    up      Spin up/install LangSmith, LangSmith Deployment, or Agent Builder
     down    Remove LangSmith from all namespaces (or a specific one with -n)
     status  Check installation status of LangSmith and LangSmith Deployment
 
 Options:
-    -l        Install LangSmith
-    -ld       Install LangSmith Deployment
+    -l        Install LangSmith (tracing, eval, playground)
+    -ld       Install LangSmith Deployment (adds LangGraph deployment to -l)
+    -lda      Install LangSmith Deployment + Agent Builder (no-code agent creation, v0.13+)
     -v        Specify version (optional)
     -n        Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i        Ingress type: alb or nginx (auto-detected if not specified)
@@ -422,6 +427,7 @@ The script automatically detects ingress endpoints using both hostname (AWS) and
 
 - Admin passwords are automatically generated with required symbols
 - Secrets are generated using OpenSSL with 32-byte entropy
+- Agent Builder Fernet encryption key is auto-generated and preserved across upgrades
 - Credentials are displayed once after installation - save them securely
 - Configuration files containing secrets are created locally - handle with care
 - When deploying LangSmith Deployment on top of an existing LangSmith installation (`up -ld` after `up -l`), secrets are automatically preserved from the existing configuration to ensure consistency
@@ -467,6 +473,9 @@ smith-fly/
 - [x] ALB hostname fix (auto-patch ingress when no custom hostname is set)
 - [x] Minikube support with auto port-forward and KEDA detection
 - [x] Minimal resource configuration for local development
+- [x] Agent Builder support (`-lda` flag) with two-phase Minikube install
+- [x] Known-bad version range detection (0.13.17–0.13.22 bootstrap regression)
+- [x] Improved teardown (LGP CRD cleanup, all PVCs, released PV cleanup)
 - [ ] Support external database configuration
 - [ ] Add metrics collection integration
 - [ ] Support air-gapped installations
