@@ -3,10 +3,10 @@
 ##############################################################################
 # LangSmith and LangSmith Deployment Installation Script for Kubernetes Clusters
 # 
-# Description: Automates the installation and management of LangSmith and 
-#              LangSmith Deployment on any Kubernetes cluster (cross-platform)
+# Description: Automates the installation and management of LangSmith,
+#              LangSmith Deployment, and Agent Builder on any Kubernetes cluster (cross-platform)
 # 
-# Usage: ./smith-fly.sh <up|down|status> [-l|-ld] [-v VERSION] [-n NAMESPACE]
+# Usage: ./smith-fly.sh <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE]
 # 
 # Date: 2025-10-14
 ##############################################################################
@@ -26,6 +26,7 @@ LS_CONFIG_YAML="${CONFIG_DIR}/ls_config.yaml"
 ACTION=""
 INSTALL_LS=false
 INSTALL_LD=false
+INSTALL_AB=false  # Agent Builder (requires Deployment)
 VERSION=""
 DEBUG=false
 NAMESPACE=""
@@ -37,6 +38,7 @@ apiKeySalt=""
 jwtSecret=""
 initialOrgAdminPassword=""
 LANGSMITH_HOSTNAME=""  # Optional: custom hostname for LangSmith (can be set via .env)
+agentBuilderEncryptionKey=""  # Fernet key for Agent Builder (auto-generated or preserved)
 
 # Color codes for output
 RED='\033[0;31m'
@@ -127,6 +129,65 @@ is_version_v12_plus() {
     fi
     
     return 1  # pre-v12
+}
+
+##############################################################################
+# Function: is_version_v13_plus
+# Description: Checks if specified version is >= 0.13.0
+# Returns: 0 if version >= 0.13.0 or empty (latest), 1 otherwise
+##############################################################################
+is_version_v13_plus() {
+    local version="$1"
+    local major minor
+
+    if [ -z "$version" ]; then
+        return 0
+    fi
+
+    IFS='.' read -r major minor _ <<< "$version"
+
+    if ! [[ "$major" =~ ^[0-9]+$ ]] || ! [[ "$minor" =~ ^[0-9]+$ ]]; then
+        return 0
+    fi
+
+    if [ "$major" -gt 0 ] || [ "$minor" -ge 13 ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+##############################################################################
+# Function: is_version_in_range
+# Description: Checks if version is within a specific minor version range (inclusive)
+# Args: version, min_minor, max_minor (assumes major=0)
+# Returns: 0 if in range, 1 otherwise. Empty version (latest) returns 1.
+##############################################################################
+is_version_in_range() {
+    local version="$1"
+    local min_minor="$2"
+    local max_minor="$3"
+    local major minor patch
+
+    if [ -z "$version" ]; then
+        return 1
+    fi
+
+    IFS='.' read -r major minor patch <<< "$version"
+
+    if ! [[ "$major" =~ ^[0-9]+$ ]] || ! [[ "$minor" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    # Only check within 0.13.x range
+    if [ "$major" -eq 0 ] && [ "$minor" -eq 13 ]; then
+        patch=${patch:-0}
+        if [ "$patch" -ge "$min_minor" ] && [ "$patch" -le "$max_minor" ]; then
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 ##############################################################################
@@ -295,16 +356,17 @@ set_ingress_type() {
 ##############################################################################
 show_usage() {
     cat << EOF
-Usage: $0 <up|down|status> [-l|-ld] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
+Usage: $0 <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
 
 Actions:
-    up      Spin up/install LangSmith or LangSmith Deployment
+    up      Spin up/install LangSmith, LangSmith Deployment, or Agent Builder
     down    Remove LangSmith from all namespaces (or a specific one with -n)
     status  Check installation status of LangSmith and LangSmith Deployment
 
 Options (for 'up' action):
-    -l      Install LangSmith
-    -ld     Install LangSmith Deployment
+    -l      Install LangSmith (tracing, eval, playground)
+    -ld     Install LangSmith Deployment (adds LangGraph deployment to -l)
+    -lda    Install LangSmith Deployment + Agent Builder (adds no-code agent creation to -ld, v0.13+)
     -v      Specify version (optional)
     -n      Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i      Ingress type: alb or nginx (auto-detected if not specified)
@@ -321,14 +383,18 @@ Examples:
     $0 up -ld                    # Install LangSmith Deployment (automatically installs LangSmith if not present)
     $0 up -ld -i nginx           # Install LangSmith Deployment with nginx ingress
     $0 up -ld -v 0.11.0          # Install LangSmith Deployment with pre-v12 config format
+    $0 up -lda                   # Install LangSmith Deployment + Agent Builder (requires more resources)
     $0 down                      # Remove LangSmith from ALL namespaces (auto-discovers deployments)
     $0 down -n my-namespace      # Remove LangSmith from a specific namespace only
     $0 status                    # Check installation status of LangSmith and LangSmith Deployment
     $0 status -n my-namespace    # Check status in a custom namespace
 
 Notes:
-    - At least one of -l or -ld must be specified with "up"
+    - At least one of -l, -ld, or -lda must be specified with "up"
     - When installing LangSmith Deployment (-ld), LangSmith is automatically installed if not already present
+    - Agent Builder (-lda) spawns additional operator-managed pods (its own Postgres, Redis, queue, API server)
+    - On Minikube, -lda auto-patches LGP resources to dev-friendly sizes and disables autoscaling
+    - Recommended Minikube resources for -lda: 10 CPUs / 24Gi RAM (Docker Desktop)
     - The "down" action removes LangSmith from all namespaces (or a specific one with -n)
     - Configuration is read from ${ENV_FILE}
     - Namespace is auto-generated from hostname unless overridden with -n
@@ -409,6 +475,11 @@ parse_arguments() {
                 INSTALL_LD=true
                 shift
                 ;;
+            -lda)
+                INSTALL_LD=true
+                INSTALL_AB=true
+                shift
+                ;;
             -v)
                 if [ $# -lt 2 ]; then
                     log ERROR "-v option requires a version argument"
@@ -455,14 +526,30 @@ parse_arguments() {
         esac
     done
     
-    # Validate that at least one of -l or -ld is specified for 'up' action
+    # Validate that at least one of -l, -ld, or -lda is specified for 'up' action
     if [ "$ACTION" = "up" ]; then
         if [ "$INSTALL_LS" = false ] && [ "$INSTALL_LD" = false ]; then
-            log ERROR "At least one of -l or -ld must be specified with 'up' action"
+            log ERROR "At least one of -l, -ld, or -lda must be specified with 'up' action"
             show_usage
         fi
     fi
     
+    # Validate version requirements for Agent Builder
+    if [ "$ACTION" = "up" ] && [ "$INSTALL_AB" = true ]; then
+        if ! is_version_v13_plus "$VERSION"; then
+            log ERROR "Agent Builder (-lda) requires chart version >= 0.13.0. Specified: ${VERSION}"
+            exit 1
+        fi
+        # Warn about known-bad version range (0.13.17 through 0.13.22)
+        # See: docs/bug-report-agent-builder-bootstrap-regression.md
+        if is_version_in_range "$VERSION" 17 22; then
+            log WARNING "Chart version ${VERSION} has a known agent-builder bootstrap regression."
+            log WARNING "The bootstrap job fails with: 'source_config.listener_id' must be set."
+            log WARNING "Recommended: use -v 0.13.16 or >= 0.13.23 instead."
+            exit 1
+        fi
+    fi
+
     # For 'down' action, remove both regardless of flags
     if [ "$ACTION" = "down" ]; then
         INSTALL_LS=true
@@ -475,6 +562,7 @@ parse_arguments() {
         log INFO "Action: ${ACTION}"
         log INFO "Install LangSmith: ${INSTALL_LS}"
         log INFO "Install LangSmith Deployment: ${INSTALL_LD}"
+        log INFO "Install Agent Builder: ${INSTALL_AB}"
         log INFO "Ingress Type: ${INGRESS_TYPE}"
         
         if [ -n "$VERSION" ]; then
@@ -636,7 +724,13 @@ generate_secrets() {
     
     # Combine and ensure we have a strong password with required symbols
     initialOrgAdminPassword="${base_part}${symbol_part}${random_part}"
-    
+
+    # Generate Fernet-compatible encryption key for Agent Builder
+    # Fernet key = URL-safe base64 encoding of 32 random bytes
+    if [ -z "$agentBuilderEncryptionKey" ]; then
+        agentBuilderEncryptionKey=$(openssl rand -base64 32 | tr '+/' '-_')
+    fi
+
     log SUCCESS "Secrets generated successfully"
 }
 
@@ -660,7 +754,11 @@ load_existing_secrets() {
     existing_salt=$(grep --color=never -E '^\s*apiKeySalt:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*apiKeySalt:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
     existing_jwt=$(grep --color=never -E '^\s*jwtSecret:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*jwtSecret:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
     existing_password=$(grep --color=never -E '^\s*initialOrgAdminPassword:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*initialOrgAdminPassword:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
-    
+
+    # Also try to preserve Agent Builder encryption key if it exists
+    local existing_ab_key
+    existing_ab_key=$(grep --color=never -E '^\s*encryptionKey:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*encryptionKey:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
+
     # Validate that all secrets exist and don't contain ANSI escape codes
     # Check for control characters that indicate corrupted values
     if [ -n "$existing_salt" ] && [ -n "$existing_jwt" ] && [ -n "$existing_password" ]; then
@@ -669,10 +767,17 @@ load_existing_secrets() {
             log WARNING "Existing secrets contain control characters, will generate new ones"
             return 1
         fi
-        
+
         apiKeySalt="$existing_salt"
         jwtSecret="$existing_jwt"
         initialOrgAdminPassword="$existing_password"
+
+        # Preserve Agent Builder encryption key if found
+        if [ -n "$existing_ab_key" ]; then
+            agentBuilderEncryptionKey="$existing_ab_key"
+            log INFO "Preserved existing Agent Builder encryption key"
+        fi
+
         log SUCCESS "Loaded existing secrets from ${LS_CONFIG_YAML}"
         return 0
     fi
@@ -708,7 +813,13 @@ create_langsmith_config() {
     else
         log INFO "Using existing secrets (preserved from previous deployment)"
     fi
-    
+
+    # Ensure Agent Builder encryption key exists (may not be in older configs)
+    if [ -z "$agentBuilderEncryptionKey" ]; then
+        agentBuilderEncryptionKey=$(openssl rand -base64 32 | tr '+/' '-_')
+        log INFO "Generated new Agent Builder encryption key"
+    fi
+
     # Escape special characters for sed
     escaped_email=$(printf '%s\n' "$initialOrgAdminEmail" | sed 's/[\/&]/\\&/g')
     escaped_license=$(printf '%s\n' "$LicenseKey" | sed 's/[\/&]/\\&/g')
@@ -1019,6 +1130,251 @@ show_status() {
 }
 
 ##############################################################################
+# Function: wait_and_patch_lgp_resources
+# Description: Waits for the agent-bootstrap job to create the LGP CRD, then
+#   patches operator-managed pod resources down to dev-friendly sizes and
+#   disables autoscaling. This prevents rolling update deadlocks on Minikube
+#   where production-sized pods can't coexist during updates.
+##############################################################################
+wait_and_patch_lgp_resources() {
+    log INFO "Waiting for Agent Builder bootstrap to create LGP resource..."
+    local max_wait=300  # 5 minutes
+    local elapsed=0
+    local lgp_name=""
+
+    while [ $elapsed -lt $max_wait ]; do
+        lgp_name=$(kubectl get lgp -n "$NAMESPACE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$lgp_name" ]; then
+            break
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+
+    if [ -z "$lgp_name" ]; then
+        log WARNING "LGP resource not found after ${max_wait}s - skipping resource patch. Agent Builder may need manual resource tuning."
+        return 0
+    fi
+
+    log INFO "Found LGP: ${lgp_name}. Patching resources to dev-friendly sizes..."
+
+    # Define the patch payload (used repeatedly since bootstrap overwrites it)
+    local lgp_patch='{
+      "spec": {
+        "autoscaling": {
+          "enabled": false,
+          "maxReplicas": 1,
+          "minReplicas": 1,
+          "queueMaxReplicas": 1,
+          "queueMinReplicas": 1
+        },
+        "serverSpec": {
+          "resources": {
+            "requests": {"cpu": "250m", "memory": "512Mi"},
+            "limits": {"cpu": "1", "memory": "2Gi"}
+          },
+          "queueResources": {
+            "requests": {"cpu": "250m", "memory": "512Mi"},
+            "limits": {"cpu": "1", "memory": "2Gi"}
+          }
+        },
+        "database": {
+          "resources": {
+            "requests": {"cpu": "250m", "memory": "512Mi"},
+            "limits": {"cpu": "1", "memory": "2Gi"}
+          }
+        },
+        "redis": {
+          "resources": {
+            "requests": {"cpu": "100m", "memory": "256Mi"},
+            "limits": {"cpu": "500m", "memory": "512Mi"}
+          }
+        }
+      }
+    }'
+
+    # Apply initial patch
+    kubectl patch lgp "$lgp_name" -n "$NAMESPACE" --type=merge -p "$lgp_patch" 2>/dev/null \
+        && log SUCCESS "LGP resources patched for local development" \
+        || log WARNING "Failed to patch LGP resources"
+
+    # Wait for the bootstrap job to complete, re-patching LGP every cycle
+    # since bootstrap overwrites our dev-sized resources with production values.
+    log INFO "Waiting for Agent Builder bootstrap to complete (this may take a few minutes)..."
+    local bootstrap_wait=0
+    local bootstrap_max=600  # 10 minutes
+    while [ $bootstrap_wait -lt $bootstrap_max ]; do
+        # Check if bootstrap job is done (pod shows Completed or no active bootstrap pod)
+        # NOTE: "|| true" is critical — without it, set -euo pipefail kills the script
+        # when grep returns non-zero (no match for an active bootstrap pod).
+        local bootstrap_active
+        bootstrap_active=$(kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null \
+            | grep "agent-bootstrap" | grep -v "Completed" | head -1 || true)
+        if [ -z "$bootstrap_active" ]; then
+            log SUCCESS "Agent Builder bootstrap completed"
+            # Final patch to ensure dev sizes stick
+            kubectl patch lgp "$lgp_name" -n "$NAMESPACE" --type=merge -p "$lgp_patch" 2>/dev/null || true
+            return 0
+        fi
+
+        # Re-apply patch every cycle to counteract bootstrap overwrites
+        kubectl patch lgp "$lgp_name" -n "$NAMESPACE" --type=merge -p "$lgp_patch" 2>/dev/null || true
+
+        # Unstick any Pending pods by deleting old ReplicaSets
+        local pending_pods
+        pending_pods=$(kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null \
+            | grep "agent-builder-" | grep "Pending" | wc -l | tr -d ' ' || echo "0")
+        if [ "$pending_pods" -gt 0 ] 2>/dev/null; then
+            log INFO "Found ${pending_pods} Pending agent-builder pod(s) — patching resources to free space..."
+        fi
+
+        sleep 10
+        bootstrap_wait=$((bootstrap_wait + 10))
+        # Log progress every 30s
+        if [ $((bootstrap_wait % 30)) -eq 0 ]; then
+            local status
+            status=$(kubectl logs -n "$NAMESPACE" -l job-name=langsmith-agent-bootstrap --tail=1 2>/dev/null \
+                | grep -o 'Status: [A-Z_]*' | tail -1 || true)
+            log INFO "Bootstrap still running... ${status:-checking}"
+        fi
+    done
+
+    log WARNING "Bootstrap did not complete within ${bootstrap_max}s - it may still be running in the background"
+}
+
+##############################################################################
+# Function: fix_agent_builder_browser_access
+# Description: After bootstrap completes, the ingress host and agent-builder
+#   config use the internal ingress DNS (needed for operator health checks).
+#   This function patches them to use localhost so the browser can reach them.
+##############################################################################
+fix_agent_builder_browser_access() {
+    local port="${1:-8080}"  # Default port-forward port
+    log INFO "Switching Agent Builder URLs from internal DNS to localhost:${port} for browser access..."
+
+    # 1. Create a separate ingress for ALL routes under host "localhost".
+    #    The operator continuously reconciles langsmith-ingress, re-adding /lgp/
+    #    paths under the internal DNS host and undoing any host-merge patches.
+    #    A separate ingress avoids this conflict entirely.
+    #    Must include BOTH the frontend "/" route AND the "/lgp/..." route, otherwise
+    #    the browser can't reach the frontend when port-forwarding to localhost.
+    local lgp_path
+    lgp_path=$(kubectl get ingress -n "$NAMESPACE" -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.loads(sys.stdin.read())
+for ing in data.get('items', []):
+    for rule in ing['spec'].get('rules', []):
+        for p in rule.get('http', {}).get('paths', []):
+            if '/lgp/' in p.get('path', ''):
+                import json as j
+                print(j.dumps({'path': p['path'], 'svc': p['backend']['service']['name'], 'port': p['backend']['service']['port']['number']}))
+                break
+" 2>/dev/null | head -1)
+
+    if [ -n "$lgp_path" ]; then
+        local lgp_route lgp_svc lgp_port
+        lgp_route=$(echo "$lgp_path" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['path'])")
+        lgp_svc=$(echo "$lgp_path" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['svc'])")
+        lgp_port=$(echo "$lgp_path" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['port'])")
+
+        kubectl apply -n "$NAMESPACE" -f - <<INGEOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: langsmith-lgp-localhost
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: localhost
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: langsmith-frontend
+            port:
+              number: 80
+      - path: ${lgp_route}
+        pathType: Prefix
+        backend:
+          service:
+            name: ${lgp_svc}
+            port:
+              number: ${lgp_port}
+INGEOF
+        log SUCCESS "Created localhost ingress with frontend and LGP routes"
+    else
+        log WARNING "Could not find LGP path in existing ingress rules"
+    fi
+
+    # 2. Patch agent-builder-config URLs for browser access
+    local ab_configmap="langsmith-agent-builder-config"
+    if kubectl get configmap "$ab_configmap" -n "$NAMESPACE" &>/dev/null; then
+        local lgp_path
+        lgp_path=$(kubectl get configmap "$ab_configmap" -n "$NAMESPACE" \
+            -o jsonpath='{.data.LANGGRAPH_API_URL_PUBLIC}' 2>/dev/null | grep -oE '/lgp/[^"]+')
+
+        if [ -n "$lgp_path" ]; then
+            kubectl patch configmap "$ab_configmap" -n "$NAMESPACE" --type=merge -p "{
+              \"data\": {
+                \"LANGGRAPH_API_URL_PUBLIC\": \"http://localhost:${port}${lgp_path}\",
+                \"VITE_AGENT_BUILDER_DEPLOYMENT_URL_PUBLIC\": \"http://localhost:${port}${lgp_path}\",
+                \"VITE_AGENT_BUILDER_GENERATOR_DEPLOYMENT_URL_PUBLIC\": \"http://localhost:${port}${lgp_path}\",
+                \"VITE_AGENT_BUILDER_MCP_SERVER_URL\": \"http://localhost:${port}/mcp\",
+                \"VITE_AGENT_BUILDER_TRIGGERS_API_URL\": \"http://localhost:${port}\"
+              }
+            }" 2>/dev/null \
+                && log SUCCESS "Agent Builder config patched for browser access" \
+                || log WARNING "Failed to patch Agent Builder config"
+        else
+            log WARNING "Could not determine LGP path from agent-builder-config"
+        fi
+
+        # 3. Restart frontend pod to pick up new config
+        kubectl delete pod -n "$NAMESPACE" -l app.kubernetes.io/component=langsmith-frontend --wait=false 2>/dev/null
+        log INFO "Frontend pod restarted to pick up new config"
+    else
+        log WARNING "Agent Builder config map not found - it may not have been created yet"
+    fi
+
+    # 4. Fix agent-builder pod's backend URLs: the bootstrap creates a secret
+    #    with https:// URLs through the ingress, which fails on self-signed certs.
+    #    Patch to use http:// internal service DNS, bypassing the ingress entirely.
+    local ab_secret
+    ab_secret=$(kubectl get secrets -n "$NAMESPACE" --no-headers 2>/dev/null | grep "agent-builder.*secrets" | awk '{print $1}' | head -1)
+    if [ -n "$ab_secret" ]; then
+        local go_ep_b64 host_ep_b64 smith_ep_b64 mcp_ep_b64
+        go_ep_b64=$(echo -n "http://langsmith-platform-backend.${NAMESPACE}.svc.cluster.local:1986" | base64)
+        host_ep_b64=$(echo -n "http://langsmith-host-backend.${NAMESPACE}.svc.cluster.local:1985" | base64)
+        smith_ep_b64=$(echo -n "http://langsmith-backend.${NAMESPACE}.svc.cluster.local:1984" | base64)
+        mcp_ep_b64=$(echo -n "http://langsmith-agent-builder-tool-server.${NAMESPACE}.svc.cluster.local:1989/mcp" | base64)
+
+        kubectl patch secret "$ab_secret" -n "$NAMESPACE" --type=merge -p "{
+          \"data\": {
+            \"GO_ENDPOINT\": \"${go_ep_b64}\",
+            \"HOST_BACKEND_ENDPOINT\": \"${host_ep_b64}\",
+            \"SMITH_BACKEND_ENDPOINT\": \"${smith_ep_b64}\",
+            \"MCP_SERVER_URL\": \"${mcp_ep_b64}\"
+          }
+        }" 2>/dev/null \
+            && log SUCCESS "Agent Builder secret patched to use internal HTTP endpoints" \
+            || log WARNING "Failed to patch Agent Builder secret"
+
+        # Restart agent-builder API and queue pods to pick up new secret
+        kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null \
+            | grep "^agent-builder-" | grep -v "redis\|tool\|trigger\|bootstrap" \
+            | awk '{print $1}' | while read -r pod; do
+                kubectl delete pod "$pod" -n "$NAMESPACE" --wait=false 2>/dev/null
+            done
+        log INFO "Agent Builder API and queue pods restarted to pick up new endpoints"
+    fi
+}
+
+##############################################################################
 # Function: install_langsmith_deployment
 # Description: Installs LangSmith Deployment using Helm
 ##############################################################################
@@ -1056,10 +1412,12 @@ install_langsmith_deployment() {
         # Priority 3: Fallback when no hostname is available
         local alb_patch_host=false
         if [ -z "$ingress_hostname" ] || [ "$ingress_hostname" = "<pending-ingress-hostname>" ]; then
-            if [ "$INGRESS_TYPE" = "alb" ]; then
-                ingress_hostname="langsmith.internal"
-                alb_patch_host=true
-                log INFO "No custom hostname for ALB - using placeholder (will patch ingress to accept all traffic)"
+            # Agent Builder on Minikube: the listener health-checks the LGP endpoint via
+            # config.hostname. "localhost" resolves to 127.0.0.1 inside pods, which can't
+            # reach the ingress controller. Use the internal ingress service DNS instead.
+            if [ "$INSTALL_AB" = true ] && is_minikube_cluster; then
+                ingress_hostname="ingress-nginx-controller.ingress-nginx.svc.cluster.local"
+                log INFO "Using internal ingress hostname for Agent Builder on Minikube: ${ingress_hostname}"
             else
                 ingress_hostname="localhost"
                 log INFO "Using default hostname: localhost (use port-forward to access)"
@@ -1068,12 +1426,25 @@ install_langsmith_deployment() {
         
         # Add deployment section to ls_config.yaml for LangSmith chart
         local temp_insert=$(mktemp)
-        log INFO "Adding config.deployment.enabled and config.hostname to LangSmith config"
-        cat > "$temp_insert" << EOF
+        if [ "$INSTALL_AB" = true ]; then
+            # Include Agent Builder config (v0.13+) alongside deployment
+            log INFO "Adding config.deployment.enabled, config.hostname, and config.agentBuilder to LangSmith config"
+            cat > "$temp_insert" << EOF
+  deployment:
+    enabled: true
+  hostname: "${ingress_hostname}"
+  agentBuilder:
+    enabled: true
+    encryptionKey: "${agentBuilderEncryptionKey}"
+EOF
+        else
+            log INFO "Adding config.deployment.enabled and config.hostname to LangSmith config"
+            cat > "$temp_insert" << EOF
   deployment:
     enabled: true
   hostname: "${ingress_hostname}"
 EOF
+        fi
         $SED_CMD -i.bak "/^config:/r $temp_insert" "$LS_CONFIG_YAML"
         rm -f "$temp_insert" "${LS_CONFIG_YAML}.bak"
         
@@ -1118,23 +1489,89 @@ EOF
         if [ "$INGRESS_TYPE" = "nginx" ] || [ "$INGRESS_TYPE" = "alb" ]; then
             helm_cmd+=" --set frontend.service.type=ClusterIP"
         fi
-        
+
+        # Enable Agent Builder components if requested (v0.13+)
+        if [ "$INSTALL_AB" = true ]; then
+            helm_cmd+=" --set agentBuilderToolServer.enabled=true"
+            helm_cmd+=" --set agentBuilderTriggerServer.enabled=true"
+            if is_minikube_cluster; then
+                helm_cmd+=" --set config.tlsEnabled=false"
+                # Disable ingress health check: the listener health-checks LGP pods
+                # via the nginx ingress, which serves HTTPS with a self-signed cert.
+                # This causes SSL_CERTIFICATE_VERIFY_FAILED inside the listener pod.
+                helm_cmd+=" --set config.deployment.ingressHealthCheckEnabled=false"
+                # Phase 1: Install WITHOUT bootstrap hook. The bootstrap job has
+                # backoffLimit=0 and runs before host-backend is fully initialized,
+                # causing guaranteed failure. Install core components first, then
+                # run bootstrap in Phase 2 when everything is stable.
+                log INFO "Minikube detected: installing in two phases (core first, bootstrap second)"
+                helm_cmd+=" --set backend.agentBootstrap.enabled=false"
+            else
+                helm_cmd+=" --set backend.agentBootstrap.enabled=true"
+            fi
+        fi
+
         if [ "$DEBUG" = true ]; then
             helm_cmd+=" --debug"
         fi
-        
+
         log INFO "Executing: ${helm_cmd}"
         eval "$helm_cmd"
-        log SUCCESS "LangSmith upgraded with deployment feature enabled"
-        
-        # For ALB without a custom hostname, remove the host rule so ALB accepts
-        # all traffic instead of filtering by the placeholder hostname.
-        if [ "$alb_patch_host" = true ]; then
-            log INFO "Patching ingress to remove host rule (ALB will accept all traffic)..."
-            kubectl patch ingress langsmith-ingress -n "$NAMESPACE" --type=json \
-                -p='[{"op":"remove","path":"/spec/rules/0/host"}]' 2>/dev/null \
-                && log SUCCESS "Ingress patched - ALB will route all traffic" \
-                || log WARNING "Could not patch ingress host rule - ALB may require Host header matching"
+        if [ "$INSTALL_AB" = true ]; then
+            if is_minikube_cluster; then
+                log SUCCESS "Phase 1 complete: core components installed"
+
+                # Wait for all key deployments to be fully ready before bootstrap
+                log INFO "Waiting for all deployments to stabilize before running bootstrap..."
+                for dep in langsmith-host-backend langsmith-listener langsmith-backend langsmith-operator; do
+                    kubectl rollout status "deployment/${dep}" -n "$NAMESPACE" --timeout=300s 2>/dev/null || true
+                done
+                log SUCCESS "All core deployments ready"
+
+                # Phase 2: Re-run helm with bootstrap enabled and --wait=false.
+                # The bootstrap job is a Helm post-upgrade hook with backoffLimit=0,
+                # which means --wait will fail if the hook fails even once.
+                # We use --wait=false here and let wait_and_patch_lgp_resources
+                # handle monitoring the bootstrap progress.
+                log INFO "Phase 2: running agent bootstrap..."
+                local helm_cmd2="helm upgrade langsmith langchain/langsmith"
+                helm_cmd2+=" --namespace \"${NAMESPACE}\""
+                helm_cmd2+=" --values \"${LS_CONFIG_YAML}\""
+                helm_cmd2+=" --wait=false"
+                helm_cmd2+=" --timeout 30m"
+                helm_cmd2+=" --hide-notes"
+                helm_cmd2+=" --set backend.agentBootstrap.enabled=true"
+                helm_cmd2+=" --set agentBuilderToolServer.enabled=true"
+                helm_cmd2+=" --set agentBuilderTriggerServer.enabled=true"
+                helm_cmd2+=" --set config.tlsEnabled=false"
+                helm_cmd2+=" --set config.deployment.ingressHealthCheckEnabled=false"
+                helm_cmd2+=" --set operator.kedaEnabled=false"
+                if kubectl get crd lgps.apps.langchain.ai &> /dev/null; then
+                    helm_cmd2+=" --set operator.createCRDs=false"
+                fi
+                if [ "$INGRESS_TYPE" = "nginx" ] || [ "$INGRESS_TYPE" = "alb" ]; then
+                    helm_cmd2+=" --set frontend.service.type=ClusterIP"
+                fi
+                if [ -n "$VERSION" ]; then
+                    helm_cmd2+=" --version ${VERSION}"
+                fi
+                if [ "$DEBUG" = true ]; then
+                    helm_cmd2+=" --debug"
+                fi
+
+                log INFO "Executing: ${helm_cmd2}"
+                eval "$helm_cmd2"
+                log SUCCESS "Phase 2 complete: bootstrap hook triggered"
+
+                # On Minikube: wait for bootstrap to create the LGP, then patch resources
+                wait_and_patch_lgp_resources
+                # Switch from internal DNS to localhost for browser access
+                fix_agent_builder_browser_access
+            else
+                log SUCCESS "LangSmith upgraded with deployment and Agent Builder enabled"
+            fi
+        else
+            log SUCCESS "LangSmith upgraded with deployment feature enabled"
         fi
     else
         # Pre-v12: Enable langgraphPlatform feature
@@ -1347,17 +1784,51 @@ uninstall_from_namespace() {
     log INFO "Uninstalling Helm release 'langsmith' in ${targetNs}..."
     helm uninstall langsmith -n "$targetNs" 2>/dev/null || log WARNING "LangSmith not found or already uninstalled in ${targetNs}"
 
+    # Delete LGP custom resources first — the operator creates pods (api, queue,
+    # redis, postgres) that hold PVCs open. Must remove these before PVC deletion.
+    if kubectl get crd lgps.apps.langchain.ai &>/dev/null; then
+        log INFO "Deleting LGP resources in ${targetNs}..."
+        kubectl delete lgp --all -n "$targetNs" --timeout=60s 2>/dev/null || true
+    fi
+
+    # Force-delete any remaining pods (LGP pods may linger after CRD deletion)
+    local remaining_pods
+    remaining_pods=$(kubectl get pods -n "$targetNs" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$remaining_pods" -gt 0 ] 2>/dev/null; then
+        log INFO "Force-deleting ${remaining_pods} remaining pod(s) in ${targetNs}..."
+        kubectl delete pods --all -n "$targetNs" --force --grace-period=0 2>/dev/null || true
+    fi
+
     # List PVCs
     log INFO "Listing Persistent Volume Claims in ${targetNs}..."
     kubectl get pvc -n "$targetNs" 2>/dev/null || log INFO "No PVCs found in ${targetNs}"
 
-    # Delete PVCs
-    log INFO "Deleting Persistent Volume Claims in ${targetNs}..."
-    kubectl delete pvc \
-        data-langsmith-clickhouse-0 \
-        data-langsmith-postgres-0 \
-        data-langsmith-redis-0 \
-        -n "$targetNs" --ignore-not-found 2>/dev/null || true
+    # Delete ALL PVCs in the namespace (not just the known names — LGP creates its own)
+    log INFO "Deleting all Persistent Volume Claims in ${targetNs}..."
+    kubectl delete pvc --all -n "$targetNs" --ignore-not-found 2>/dev/null || true
+
+    # Clean up Released PVs that were bound to this namespace.
+    # On Minikube, hostPath PVs retain data on disk after PVC deletion. If a new
+    # install creates PVCs with the same name, Minikube may reuse the old hostPath
+    # directory, causing data from a previous install to leak into the new one
+    # (e.g., Fernet-encrypted secrets with a different key → InvalidToken errors).
+    log INFO "Cleaning up Released PersistentVolumes from ${targetNs}..."
+    local released_pvs
+    released_pvs=$(kubectl get pv -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.loads(sys.stdin.read())
+for pv in data.get('items', []):
+    ref = pv.get('spec', {}).get('claimRef', {})
+    status = pv.get('status', {}).get('phase', '')
+    if ref.get('namespace') == '${targetNs}' and status in ('Released', 'Failed'):
+        print(pv['metadata']['name'])
+" 2>/dev/null || true)
+    if [ -n "$released_pvs" ]; then
+        echo "$released_pvs" | while IFS= read -r pv_name; do
+            [ -n "$pv_name" ] && kubectl delete pv "$pv_name" --ignore-not-found 2>/dev/null || true
+        done
+        log SUCCESS "Cleaned up Released PVs for ${targetNs}"
+    fi
 
     # Delete namespace
     log INFO "Deleting namespace: ${targetNs}"
