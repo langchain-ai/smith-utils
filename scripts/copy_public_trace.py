@@ -49,35 +49,61 @@ class PublicTraceDownloader:
         response.raise_for_status()
         return response.json()
     
-    def get_all_runs(self) -> List[Dict[str, Any]]:
-        """Fetch all runs in the shared trace."""
-        runs = []
-        offset = 0
-        limit = 100
-        
-        while True:
-            url = f"{self.base_url}/public/{self.share_token}/runs/query"
-            payload = {
-                "offset": offset,
-                "limit": limit,
-            }
-            
-            response = requests.post(url, json=payload)
+    def get_all_runs(self, root_run: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Fetch all runs in the shared trace, including child runs.
+
+        The public runs/query endpoint only returns root runs by default.
+        To get child runs, we use child_run_ids from the root run (fetched
+        via the /run endpoint which includes them) and query by ID.
+
+        Args:
+            root_run: Root run from get_root_run() which contains child_run_ids.
+        """
+        url = f"{self.base_url}/public/{self.share_token}/runs/query"
+
+        # Get root runs via query (full run data)
+        response = requests.post(url, json={"offset": 0, "limit": 100})
+        response.raise_for_status()
+        root_runs = response.json().get("runs", [])
+
+        if not root_runs:
+            return []
+
+        # Collect child_run_ids — the /run endpoint includes them, query may not
+        all_child_ids = []
+        if root_run:
+            all_child_ids.extend(root_run.get("child_run_ids") or [])
+        for run in root_runs:
+            all_child_ids.extend(run.get("child_run_ids") or [])
+
+        if not all_child_ids:
+            return root_runs
+
+        # Fetch child runs in batches (query by ID list)
+        child_runs = []
+        batch_size = 100
+        for i in range(0, len(all_child_ids), batch_size):
+            batch_ids = all_child_ids[i:i + batch_size]
+            response = requests.post(url, json={"id": batch_ids, "limit": batch_size})
             response.raise_for_status()
-            data = response.json()
-            
-            batch = data.get("runs", [])
-            if not batch:
-                break
-                
-            runs.extend(batch)
-            offset += len(batch)
-            
-            # Check if we've fetched all runs
-            if len(batch) < limit:
-                break
-        
-        return runs
+            batch = response.json().get("runs", [])
+            child_runs.extend(batch)
+
+            # Recursively collect grandchild IDs
+            for run in batch:
+                grandchild_ids = run.get("child_run_ids") or []
+                all_child_ids.extend(grandchild_ids)
+
+        # Combine and deduplicate
+        seen_ids = set()
+        all_runs = []
+        for run in root_runs + child_runs:
+            rid = run["id"]
+            if rid not in seen_ids:
+                seen_ids.add(rid)
+                all_runs.append(run)
+
+        return all_runs
     
     def get_feedbacks(self, run_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Fetch feedbacks associated with the shared runs."""
@@ -305,7 +331,12 @@ def main():
     
     parser.add_argument(
         "--endpoint",
-        help="LangSmith API endpoint (overrides --region if specified)"
+        help="Target LangSmith API endpoint for upload (overrides --region if specified)"
+    )
+
+    parser.add_argument(
+        "--source-endpoint",
+        help="Source LangSmith API endpoint to fetch the public trace from (default: https://api.smith.langchain.com)"
     )
     
     parser.add_argument(
@@ -344,18 +375,22 @@ def main():
         print("Error: API key required. Set LANGSMITH_API_KEY or use --api-key", file=sys.stderr)
         sys.exit(1)
     
+    # Source endpoint for fetching (always prod unless overridden)
+    source_endpoint = args.source_endpoint or "https://api.smith.langchain.com"
+
     try:
         # Step 1: Download the public trace
         print(f"Fetching public trace with token: {args.share_token}")
-        print(f"Using endpoint: {endpoint}")
-        downloader = PublicTraceDownloader(args.share_token, endpoint)
+        print(f"  Source: {source_endpoint}")
+        print(f"  Target: {endpoint}")
+        downloader = PublicTraceDownloader(args.share_token, source_endpoint)
         
         print("  Downloading root run...")
         root_run = downloader.get_root_run()
         print(f"  ✓ Root run: {root_run.get('name')} (ID: {root_run.get('id')})")
         
         print("  Downloading all runs in trace...")
-        all_runs = downloader.get_all_runs()
+        all_runs = downloader.get_all_runs(root_run=root_run)
         print(f"  ✓ Found {len(all_runs)} runs")
         
         # Step 2: Transform the runs
@@ -382,9 +417,37 @@ def main():
         client = Client(api_key=api_key, api_url=endpoint)
         uploader = TraceUploader(client)
         uploader.upload_runs(transformed_runs, args.project)
-        
+
+        # Step 4: Copy feedbacks
+        print("\nFetching feedbacks...")
+        run_ids = [str(r["id"]) for r in all_runs]
+        feedbacks = downloader.get_feedbacks(run_ids)
+        print(f"  Found {len(feedbacks)} feedbacks")
+
+        if feedbacks:
+            print("  Uploading feedbacks...")
+            fb_uploaded = 0
+            for fb in feedbacks:
+                try:
+                    old_run_id = str(fb.get("run_id", ""))
+                    new_run_id = transformer.id_mapping.get(old_run_id)
+                    if not new_run_id:
+                        continue
+                    client.create_feedback(
+                        run_id=new_run_id,
+                        key=fb.get("key", "unknown"),
+                        score=fb.get("score"),
+                        value=fb.get("value"),
+                        comment=fb.get("comment"),
+                    )
+                    fb_uploaded += 1
+                except Exception as e:
+                    print(f"    Warning: Failed to copy feedback {fb.get('key')}: {e}")
+            print(f"  ✓ Uploaded {fb_uploaded} feedbacks")
+
         print(f"\n✓ Successfully copied trace to project '{args.project}'!")
         print(f"  Original runs: {len(all_runs)}")
+        print(f"  Feedbacks: {len(feedbacks)}")
         print(f"  New trace ID: {transformer.new_trace_id}")
         
     except requests.HTTPError as e:

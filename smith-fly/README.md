@@ -251,6 +251,37 @@ kubectl get ingressclass
 kubectl get ingress -n <namespace> -o yaml
 ```
 
+#### ClusterRole Ownership Conflict
+
+If you see an error like:
+```
+ClusterRole "langsmith-operator" in namespace "" exists and cannot be imported into the current release:
+invalid ownership metadata; annotation validation error: key "meta.helm.sh/release-namespace" must equal "<your-namespace>": current value is "<other-namespace>"
+```
+
+This means another LangSmith Helm release on the cluster already owns the cluster-scoped `ClusterRole`. The script handles this automatically by setting `operator.watchNamespaces` to scope RBAC to your namespace. If you hit this on an older version of the script, update and re-run.
+
+#### Endpoint Shows PENDING (ALB)
+
+If the endpoint shows `PENDING` after installation on AWS EKS, the ALB may have failed to provision:
+
+```bash
+# Check ingress events for errors
+kubectl get events -n <namespace> --field-selector involvedObject.name=langsmith-ingress
+
+# Check if ALB controller is running
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+```
+
+Common causes:
+- **Invalid host condition**: ALB rejects `localhost` or other non-FQDN hostnames. The script handles this automatically for new installs by patching the ingress. For existing installs, set `LANGSMITH_HOSTNAME` in `config/.env` to a valid domain, or manually remove the host rule:
+  ```bash
+  kubectl patch ingress langsmith-ingress -n <namespace> --type=json \
+      -p='[{"op":"remove","path":"/spec/rules/0/host"}]'
+  ```
+- **Missing ALB controller**: Ensure the AWS Load Balancer Controller is installed on the cluster.
+- **IAM permissions**: The ALB controller needs permissions to create load balancers.
+
 #### Database Connection Issues
 
 ```bash
@@ -333,7 +364,10 @@ frontend:
 
 ### Shared Cluster Support
 
-The script supports deploying multiple LangSmith installations in different namespaces on the same cluster using the `-n` flag. It automatically skips CRD creation (`operator.createCRDs=false`) to avoid Helm ownership conflicts when CRDs are already present from another installation.
+The script supports deploying multiple LangSmith installations in different namespaces on the same cluster using the `-n` flag. It handles two common conflict sources automatically:
+
+- **CRDs**: Skips CRD creation (`operator.createCRDs=false`) when `lgps.apps.langchain.ai` already exists from another installation.
+- **ClusterRole**: Sets `operator.watchNamespaces` to the target namespace so the chart creates a namespaced `Role`/`RoleBinding` instead of a cluster-scoped `ClusterRole`. This avoids the `"invalid ownership metadata"` error that occurs when a `ClusterRole "langsmith-operator"` already exists and is owned by a different release namespace.
 
 ```bash
 # Deploy to multiple namespaces on the same cluster
@@ -372,6 +406,8 @@ ingress:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
 ```
+
+When deploying with LangSmith Deployment (`-ld`) on ALB and no `LANGSMITH_HOSTNAME` is set, the script uses a placeholder hostname to satisfy chart validation, then patches the ingress to remove the host rule so the ALB accepts all traffic. The endpoint will be the auto-generated ALB DNS name (e.g., `k8s-testns-langsmit-xxxx.us-east-1.elb.amazonaws.com`). To use a custom domain instead, set `LANGSMITH_HOSTNAME` in `config/.env`.
 
 **nginx Ingress (Non-AWS):**
 ```yaml
@@ -426,8 +462,9 @@ smith-fly/
 - [x] Support multiple ingress types (ALB/nginx via `-i` flag)
 - [x] Auto-detect cluster type for ingress (EKS -> ALB, others -> nginx)
 - [x] Configure replicas in `config.yaml` (default: 1 per component)
-- [x] Support shared clusters (automatic CRD conflict handling)
+- [x] Support shared clusters (automatic CRD and ClusterRole conflict handling)
 - [x] Preserve secrets when upgrading LangSmith to LangSmith Deployment
+- [x] ALB hostname fix (auto-patch ingress when no custom hostname is set)
 - [x] Minikube support with auto port-forward and KEDA detection
 - [x] Minimal resource configuration for local development
 - [ ] Support external database configuration
