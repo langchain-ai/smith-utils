@@ -1176,17 +1176,17 @@ wait_and_patch_lgp_resources() {
         "serverSpec": {
           "resources": {
             "requests": {"cpu": "250m", "memory": "512Mi"},
-            "limits": {"cpu": "1", "memory": "2Gi"}
+            "limits": {"cpu": "1", "memory": "1Gi"}
           },
           "queueResources": {
             "requests": {"cpu": "250m", "memory": "512Mi"},
-            "limits": {"cpu": "1", "memory": "2Gi"}
+            "limits": {"cpu": "1", "memory": "1Gi"}
           }
         },
         "database": {
           "resources": {
             "requests": {"cpu": "250m", "memory": "512Mi"},
-            "limits": {"cpu": "1", "memory": "2Gi"}
+            "limits": {"cpu": "1", "memory": "1Gi"}
           }
         },
         "redis": {

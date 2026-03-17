@@ -16,7 +16,7 @@
 
 # --- Safety Buffers (internal defaults) ---
 # These ensure macOS stays responsive while giving Minikube adequate resources
-SAFETY_BUFFER_GB=4       # Extra GB buffer on top of current usage for macOS headroom
+SAFETY_BUFFER_GB=2       # Extra GB buffer on top of current usage for macOS headroom
 MIN_MINIKUBE_MEM_GB=4    # Minimum GB required for Minikube to be useful
 MIN_MINIKUBE_CPUS=2      # Minimum CPUs required for Minikube
 

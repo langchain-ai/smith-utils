@@ -47,10 +47,10 @@ frontend:
     resources:
       requests:
         cpu: 100m
-        memory: 512Mi
+        memory: 256Mi
       limits:
         cpu: 500m
-        memory: 1Gi
+        memory: 512Mi
 
 platformBackend:
   deployment:
@@ -111,10 +111,10 @@ redis:
     resources:
       requests:
         cpu: 100m
-        memory: 512Mi
+        memory: 256Mi
       limits:
         cpu: 500m
-        memory: 1Gi
+        memory: 512Mi
 
 # ClickHouse is the most resource-intensive component
 # Official minimum is 16Gi
@@ -123,10 +123,10 @@ clickhouse:
     resources:
       requests:
         cpu: 200m
-        memory: 1Gi
+        memory: 1.5Gi
       limits:
         cpu: 1000m
-        memory: 2Gi
+        memory: 3Gi
 
 
 # =============================================================================
@@ -142,10 +142,10 @@ ingestQueue:
     resources:
       requests:
         cpu: 100m
-        memory: 512Mi
+        memory: 256Mi
       limits:
         cpu: 500m
-        memory: 1Gi
+        memory: 512Mi
 
 aceBackend:
   deployment:
@@ -164,10 +164,10 @@ hostBackend:
     resources:
       requests:
         cpu: 100m
-        memory: 256Mi
+        memory: 512Mi
       limits:
         cpu: 500m
-        memory: 512Mi
+        memory: 1Gi
 
 listener:
   deployment:
@@ -192,10 +192,10 @@ operator:
     resources:
       requests:
         cpu: 100m
-        memory: 512Mi
+        memory: 256Mi
       limits:
         cpu: 500m
-        memory: 1Gi
+        memory: 512Mi
 
 
 # =============================================================================
