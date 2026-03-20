@@ -19,6 +19,7 @@ Key capabilities:
 - LangSmith Deployments UI enabled by default (shows in LangSmith menu)
 - Shared cluster support (multiple installations without CRD conflicts)
 - Agent Builder support (`-lda` flag, chart v0.13+) with two-phase Minikube install
+- Post-install synthetic data population (`-p` flag) with traces, feedback, datasets, and prompts
 
 ## Requirements
 
@@ -104,6 +105,9 @@ config:
 # Install LangSmith Deployment with specific ingress (override auto-detect)
 ./smith-fly.sh up -ld -i nginx
 
+# Install LangSmith and populate with synthetic test data
+./smith-fly.sh up -l -p
+
 # Install LangSmith Deployment + Agent Builder (requires chart v0.13+)
 ./smith-fly.sh up -lda
 
@@ -117,7 +121,7 @@ config:
 ### Command Options
 
 ```
-Usage: ./smith-fly.sh <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
+Usage: ./smith-fly.sh <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [-p] [--debug]
 
 Actions:
     up      Spin up/install LangSmith, LangSmith Deployment, or Agent Builder
@@ -131,6 +135,7 @@ Options:
     -v        Specify version (optional)
     -n        Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i        Ingress type: alb or nginx (auto-detected if not specified)
+    -p        Populate with synthetic test data after install (traces, feedback, datasets, prompts)
     --debug   Enable Helm debug output (optional)
 ```
 
@@ -451,6 +456,7 @@ smith-fly/
 │   ├── config.yaml         # Base Helm values (includes minimal resource config)
 │   └── ls_config.yaml      # Generated LangSmith config (temporary)
 └── scripts/
+    ├── populate.sh         # Synthetic data population (traces, feedback, datasets, prompts)
     └── mac/
         └── minikube.sh     # macOS Minikube starter with auto resource detection
 ```
