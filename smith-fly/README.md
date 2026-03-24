@@ -19,7 +19,7 @@ Key capabilities:
 - LangSmith Deployments UI enabled by default (shows in LangSmith menu)
 - Shared cluster support (multiple installations without CRD conflicts)
 - Agent Builder support (`-lda` flag, chart v0.13+) with two-phase Minikube install
-- Post-install synthetic data population (`-p` flag) with traces, feedback, datasets, and prompts
+- Post-install synthetic data population (append `s` to any flag, e.g. `-ls`, `-lds`, `-ldas`) with traces, feedback, datasets, and prompts
 
 ## Requirements
 
@@ -106,7 +106,7 @@ config:
 ./smith-fly.sh up -ld -i nginx
 
 # Install LangSmith and populate with synthetic test data
-./smith-fly.sh up -l -p
+./smith-fly.sh up -ls
 
 # Install LangSmith Deployment + Agent Builder (requires chart v0.13+)
 ./smith-fly.sh up -lda
@@ -121,7 +121,7 @@ config:
 ### Command Options
 
 ```
-Usage: ./smith-fly.sh <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [-p] [--debug]
+Usage: ./smith-fly.sh <up|down|status> [-l|-ls|-ld|-lds|-lda|-ldas] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
 
 Actions:
     up      Spin up/install LangSmith, LangSmith Deployment, or Agent Builder
@@ -130,12 +130,14 @@ Actions:
 
 Options:
     -l        Install LangSmith (tracing, eval, playground)
+    -ls       Install LangSmith + populate with synthetic test data
     -ld       Install LangSmith Deployment (adds LangGraph deployment to -l)
+    -lds      Install LangSmith Deployment + populate with synthetic test data
     -lda      Install LangSmith Deployment + Agent Builder (no-code agent creation, v0.13+)
+    -ldas     Install LangSmith Deployment + Agent Builder + populate with synthetic test data
     -v        Specify version (optional)
     -n        Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i        Ingress type: alb or nginx (auto-detected if not specified)
-    -p        Populate with synthetic test data after install (traces, feedback, datasets, prompts)
     --debug   Enable Helm debug output (optional)
 ```
 

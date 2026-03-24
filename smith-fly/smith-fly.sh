@@ -6,7 +6,7 @@
 # Description: Automates the installation and management of LangSmith,
 #              LangSmith Deployment, and Agent Builder on any Kubernetes cluster (cross-platform)
 # 
-# Usage: ./smith-fly.sh <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE] [-p]
+# Usage: ./smith-fly.sh <up|down|status> [-l|-ls|-ld|-lds|-lda|-ldas] [-v VERSION] [-n NAMESPACE]
 # 
 # Date: 2025-10-14
 ##############################################################################
@@ -363,7 +363,7 @@ set_ingress_type() {
 ##############################################################################
 show_usage() {
     cat << EOF
-Usage: $0 <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [-p] [--debug]
+Usage: $0 <up|down|status> [-l|-ls|-ld|-lds|-lda|-ldas] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
 
 Actions:
     up      Spin up/install LangSmith, LangSmith Deployment, or Agent Builder
@@ -372,12 +372,14 @@ Actions:
 
 Options (for 'up' action):
     -l      Install LangSmith (tracing, eval, playground)
+    -ls     Install LangSmith + populate with synthetic test data (traces, feedback, datasets, prompts)
     -ld     Install LangSmith Deployment (adds LangGraph deployment to -l)
+    -lds    Install LangSmith Deployment + populate with synthetic test data
     -lda    Install LangSmith Deployment + Agent Builder (adds no-code agent creation to -ld, v0.13+)
+    -ldas   Install LangSmith Deployment + Agent Builder + populate with synthetic test data
     -v      Specify version (optional)
     -n      Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i      Ingress type: alb or nginx (auto-detected if not specified)
-    -p      Populate LangSmith with synthetic test data after install (traces, feedback, datasets, prompts)
     --debug Enable Helm debug output (optional)
 
 Examples:
@@ -391,7 +393,8 @@ Examples:
     $0 up -ld                    # Install LangSmith Deployment (automatically installs LangSmith if not present)
     $0 up -ld -i nginx           # Install LangSmith Deployment with nginx ingress
     $0 up -ld -v 0.11.0          # Install LangSmith Deployment with pre-v12 config format
-    $0 up -l -p                   # Install LangSmith and populate with synthetic test data
+    $0 up -ls                    # Install LangSmith and populate with synthetic test data
+    $0 up -ldas                  # Install everything + populate with synthetic test data
     $0 up -lda                   # Install LangSmith Deployment + Agent Builder (requires more resources)
     $0 down                      # Remove LangSmith from ALL namespaces (auto-discovers deployments)
     $0 down -n my-namespace      # Remove LangSmith from a specific namespace only
@@ -399,7 +402,7 @@ Examples:
     $0 status -n my-namespace    # Check status in a custom namespace
 
 Notes:
-    - At least one of -l, -ld, or -lda must be specified with "up"
+    - At least one of -l, -ls, -ld, -lds, -lda, or -ldas must be specified with "up"
     - When installing LangSmith Deployment (-ld), LangSmith is automatically installed if not already present
     - Agent Builder (-lda) spawns additional operator-managed pods (its own Postgres, Redis, queue, API server)
     - On Minikube, -lda auto-patches LGP resources to dev-friendly sizes and disables autoscaling
@@ -480,8 +483,18 @@ parse_arguments() {
                 INSTALL_LS=true
                 shift
                 ;;
+            -ls)
+                INSTALL_LS=true
+                POPULATE=true
+                shift
+                ;;
             -ld)
                 INSTALL_LD=true
+                shift
+                ;;
+            -lds)
+                INSTALL_LD=true
+                POPULATE=true
                 shift
                 ;;
             -lda)
@@ -489,7 +502,9 @@ parse_arguments() {
                 INSTALL_AB=true
                 shift
                 ;;
-            -p)
+            -ldas)
+                INSTALL_LD=true
+                INSTALL_AB=true
                 POPULATE=true
                 shift
                 ;;
@@ -2044,7 +2059,7 @@ main() {
                     display_langsmith_info
                 fi
 
-                # Populate with synthetic test data if -p was specified
+                # Populate with synthetic test data if -s was specified
                 if [ "$POPULATE" = true ]; then
                     if [ -n "$RESOLVED_ENDPOINT" ]; then
                         run_populate "$RESOLVED_ENDPOINT" || true
