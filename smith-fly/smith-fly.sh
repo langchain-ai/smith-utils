@@ -1624,17 +1624,26 @@ install_langsmith_deployment() {
         if [ -n "$LANGSMITH_HOSTNAME" ]; then
             ingress_hostname="$LANGSMITH_HOSTNAME"
             log INFO "Using user-specified hostname: ${ingress_hostname}"
-        # Priority 2: Check existing ingress immediately (no polling - for upgrades)
-        # Uses a single kubectl call; if the ingress/ALB isn't ready yet we fall
-        # through to the localhost fallback rather than blocking for 5 minutes.
+        # Priority 2: Check existing ingress with short poll (gives ALB controller
+        # time to settle after a previous Helm upgrade before we read the hostname).
         elif ! is_minikube_cluster; then
             log INFO "Checking for existing ingress hostname..."
-            ingress_hostname=$(kubectl get ingress -n "$NAMESPACE" \
-                -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-            if [ -z "$ingress_hostname" ]; then
+            local alb_attempts=0
+            local alb_max=6
+            while [ $alb_attempts -lt $alb_max ]; do
                 ingress_hostname=$(kubectl get ingress -n "$NAMESPACE" \
-                    -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
-            fi
+                    -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+                if [ -z "$ingress_hostname" ]; then
+                    ingress_hostname=$(kubectl get ingress -n "$NAMESPACE" \
+                        -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+                fi
+                if [ -n "$ingress_hostname" ] && [ "$ingress_hostname" != "<pending>" ]; then
+                    break
+                fi
+                alb_attempts=$((alb_attempts + 1))
+                log INFO "Waiting for ingress hostname... (attempt ${alb_attempts}/${alb_max})"
+                sleep 5
+            done
             [ -n "$ingress_hostname" ] && log INFO "Found existing ingress hostname: ${ingress_hostname}"
             # Convert IP to nip.io if needed for nginx ingress
             if [ -n "$ingress_hostname" ] && [ "$ingress_hostname" != "<pending-ingress-hostname>" ] && [ "$INGRESS_TYPE" = "nginx" ]; then
@@ -1793,6 +1802,26 @@ install_langsmith_deployment() {
 
         # Execute helm upgrade with live pod progress
         helm_with_progress "$helm_cmd"
+
+        # After Helm upgrade, verify the ingress host rule matches the actual ALB.
+        # The ALB controller may assign a different DNS than what was in the config
+        # (e.g., after ALB recreation or listener reconfiguration).
+        if [ "$INGRESS_TYPE" = "alb" ]; then
+            local actual_alb_host spec_host
+            actual_alb_host=$(kubectl get ingress langsmith-ingress -n "$NAMESPACE" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            spec_host=$(kubectl get ingress langsmith-ingress -n "$NAMESPACE" \
+                -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo "")
+            if [ -n "$actual_alb_host" ] && [ -n "$spec_host" ] && [ "$actual_alb_host" != "$spec_host" ]; then
+                log WARNING "ALB hostname mismatch: spec.rules.host=${spec_host} but actual ALB=${actual_alb_host}"
+                log INFO "Updating config hostname and re-running Helm upgrade..."
+                $SED_CMD -i.bak "s|${spec_host}|${actual_alb_host}|g" "$LS_CONFIG_YAML"
+                rm -f "${LS_CONFIG_YAML}.bak"
+                helm_with_progress "$helm_cmd"
+                log SUCCESS "Ingress host rule now matches actual ALB hostname"
+            fi
+        fi
+
         if [ "$INSTALL_AB" = true ]; then
             if is_minikube_cluster; then
                 log SUCCESS "Phase 1 complete: core components installed"
