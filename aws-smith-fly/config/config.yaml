@@ -1,0 +1,192 @@
+# Configuration for LangSmith
+# MINIMAL TESTABLE CONFIGURATION - Not for production use
+# Official minimum: 16 vCPU, 64Gi RAM cluster-wide
+# This config: ~2 vCPU, ~6Gi RAM requests (bare minimum testing only)
+
+config:
+  # hostname: Added dynamically by smith-fly.sh when deployment is enabled (v12+).
+  #   Override with LANGSMITH_HOSTNAME in .env for custom domain.
+  langsmithLicenseKey: ""
+  apiKeySalt: ""
+  authType: "mixed"
+  basicAuth:
+    enabled: true
+    initialOrgAdminEmail: ""
+    initialOrgAdminPassword: ""
+    jwtSecret: ""
+
+
+ingress:
+  enabled: true
+  ingressClassName: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+
+
+# =============================================================================
+# CORE BACKEND SERVICES (minimal resources for testing)
+# =============================================================================
+
+backend:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+frontend:
+  service:
+    type: ClusterIP
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+platformBackend:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+playground:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+queue:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+
+# =============================================================================
+# STATEFUL DATA SERVICES (require more memory than app services)
+# Official minimum: ClickHouse 16Gi, Postgres 8Gi, Redis 4Gi
+# Testing minimum below - may have performance issues
+# =============================================================================
+
+postgres:
+  persistence:
+    enabled: false
+  statefulSet:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+redis:
+  persistence:
+    enabled: false
+  statefulSet:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+# ClickHouse is the most resource-intensive component
+# Official minimum is 16Gi
+clickhouse:
+  statefulSet:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 1Gi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+
+
+# =============================================================================
+# LANGGRAPH DEPLOYMENT COMPONENTS (for -ld flag)
+# NOTE: These components are for v0.12+ only. For v0.11 and earlier, these
+# settings will be ignored by Helm (no error, just won't apply).
+# v0.11 uses different component names/structure managed by langgraphPlatform.
+# =============================================================================
+
+ingestQueue:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+aceBackend:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+hostBackend:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+listener:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+operator:
+  deployment:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
