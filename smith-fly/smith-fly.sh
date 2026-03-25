@@ -27,6 +27,8 @@ ACTION=""
 INSTALL_LS=false
 INSTALL_LD=false
 INSTALL_AB=false  # Agent Builder (requires Deployment)
+INSTALL_INSIGHTS=false  # Insights (requires Deployment + Agent Builder)
+INSTALL_POLLY=false     # Polly (requires Deployment + Agent Builder)
 OPERATOR_SCALED_DOWN=false  # Safety flag: true while operator is at 0 replicas during bootstrap
 VERSION=""
 DEBUG=false
@@ -40,6 +42,8 @@ jwtSecret=""
 initialOrgAdminPassword=""
 LANGSMITH_HOSTNAME=""  # Optional: custom hostname for LangSmith (can be set via .env)
 agentBuilderEncryptionKey=""  # Fernet key for Agent Builder (auto-generated or preserved)
+insightsEncryptionKey=""      # Fernet key for Insights (auto-generated or preserved)
+pollyEncryptionKey=""         # Fernet key for Polly (auto-generated or preserved)
 
 # Color codes for output
 RED='\033[0;31m'
@@ -371,7 +375,11 @@ Actions:
 Options (for 'up' action):
     -l      Install LangSmith (tracing, eval, playground)
     -ld     Install LangSmith Deployment (adds LangGraph deployment to -l)
-    -lda    Install LangSmith Deployment + Agent Builder (adds no-code agent creation to -ld, v0.13+)
+    -ld[a][i][p]  Install LangSmith Deployment with optional add-ons (v0.13+ required for add-ons):
+                    a = Agent Builder (no-code agent creation)
+                    i = Insights
+                    p = Polly
+                  Letters can be combined in any order, e.g. -lda -ldi -ldp -ldai -ldip -ldap -ldaip
     -v      Specify version (optional)
     -n      Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i      Ingress type: alb or nginx (auto-detected if not specified)
@@ -388,7 +396,12 @@ Examples:
     $0 up -ld                    # Install LangSmith Deployment (automatically installs LangSmith if not present)
     $0 up -ld -i nginx           # Install LangSmith Deployment with nginx ingress
     $0 up -ld -v 0.11.0          # Install LangSmith Deployment with pre-v12 config format
-    $0 up -lda                   # Install LangSmith Deployment + Agent Builder (requires more resources)
+    $0 up -lda                   # Install LangSmith Deployment + Agent Builder
+    $0 up -ldi                   # Install LangSmith Deployment + Insights
+    $0 up -ldp                   # Install LangSmith Deployment + Polly
+    $0 up -ldai                  # Install LangSmith Deployment + Agent Builder + Insights
+    $0 up -ldip                  # Install LangSmith Deployment + Insights + Polly
+    $0 up -ldaip                 # Install LangSmith Deployment + Agent Builder + Insights + Polly
     $0 down                      # Remove LangSmith from ALL namespaces (auto-discovers deployments)
     $0 down -n my-namespace      # Remove LangSmith from a specific namespace only
     $0 status                    # Check installation status of LangSmith and LangSmith Deployment
@@ -476,13 +489,17 @@ parse_arguments() {
                 INSTALL_LS=true
                 shift
                 ;;
-            -ld)
+            -ld*)
+                local suffix="${1#-ld}"
+                # Validate suffix contains only valid feature letters: a, i, p
+                if [[ -n "$suffix" ]] && [[ "$suffix" =~ [^aip] ]]; then
+                    log ERROR "Unknown option: $1"
+                    show_usage
+                fi
                 INSTALL_LD=true
-                shift
-                ;;
-            -lda)
-                INSTALL_LD=true
-                INSTALL_AB=true
+                [[ "$suffix" == *"a"* ]] && INSTALL_AB=true
+                [[ "$suffix" == *"i"* ]] && INSTALL_INSIGHTS=true
+                [[ "$suffix" == *"p"* ]] && INSTALL_POLLY=true
                 shift
                 ;;
             -v)
@@ -539,10 +556,10 @@ parse_arguments() {
         fi
     fi
     
-    # Validate version requirements for Agent Builder
-    if [ "$ACTION" = "up" ] && [ "$INSTALL_AB" = true ]; then
+    # Validate version requirements for Agent Builder / Insights / Polly (all require v0.13+)
+    if [ "$ACTION" = "up" ] && { [ "$INSTALL_AB" = true ] || [ "$INSTALL_INSIGHTS" = true ] || [ "$INSTALL_POLLY" = true ]; }; then
         if ! is_version_v13_plus "$VERSION"; then
-            log ERROR "Agent Builder (-lda) requires chart version >= 0.13.0. Specified: ${VERSION}"
+            log ERROR "Agent Builder / Insights / Polly require chart version >= 0.13.0. Specified: ${VERSION}"
             exit 1
         fi
         # Warn about known-bad version range (0.13.17 through 0.13.22)
@@ -568,6 +585,8 @@ parse_arguments() {
         log INFO "Install LangSmith: ${INSTALL_LS}"
         log INFO "Install LangSmith Deployment: ${INSTALL_LD}"
         log INFO "Install Agent Builder: ${INSTALL_AB}"
+        log INFO "Install Insights: ${INSTALL_INSIGHTS}"
+        log INFO "Install Polly: ${INSTALL_POLLY}"
         log INFO "Ingress Type: ${INGRESS_TYPE}"
         
         if [ -n "$VERSION" ]; then
@@ -701,6 +720,168 @@ setup_namespace() {
 # Function: setup_helm_repo
 # Description: Adds and updates LangChain Helm repository
 ##############################################################################
+# Function: helm_with_progress
+# Description: Runs a helm command in the background and prints a live pod
+#   status summary every 15 seconds while waiting for it to complete.
+#   This prevents the terminal from appearing frozen during long --wait calls.
+# Arguments: $@ - the full helm command string passed to eval
+##############################################################################
+helm_with_progress() {
+    local helm_cmd="$1"
+    local helm_log
+    helm_log=$(mktemp)
+
+    # If a previous run was interrupted mid-upgrade the release may be stuck in a
+    # "pending-*" state, which causes "another operation is in progress" errors.
+    # Roll back to the last good revision to clear the lock before proceeding.
+    local release_status
+    release_status=$(helm status langsmith -n "$NAMESPACE" -o json 2>/dev/null \
+        | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('info',{}).get('status',''))" \
+        2>/dev/null) || release_status=""
+    if [[ "$release_status" == pending-* ]]; then
+        if [[ "$release_status" == "pending-install" ]]; then
+            # No prior revision exists — uninstall to clear the lock
+            log WARNING "Helm release is stuck in '${release_status}' — uninstalling to clear lock..."
+            helm uninstall langsmith -n "$NAMESPACE" 2>/dev/null || true
+        else
+            # pending-upgrade/pending-rollback — roll back to last good revision
+            log WARNING "Helm release is stuck in '${release_status}' — rolling back to recover..."
+            helm rollback langsmith -n "$NAMESPACE" 2>/dev/null || true
+        fi
+    fi
+
+    # Delete the ingress only when the operator's field manager ("manager") owns
+    # .spec.rules — Helm's apply conflicts with that ownership and fails.
+    # Skipping deletion when the operator hasn't touched the ingress avoids
+    # forcing the ALB controller to provision a new ALB with a new hostname.
+    if kubectl get ingress langsmith-ingress -n "$NAMESPACE" &>/dev/null; then
+        local ingress_managers
+        ingress_managers=$(kubectl get ingress langsmith-ingress -n "$NAMESPACE" \
+            -o jsonpath='{.metadata.managedFields[*].manager}' 2>/dev/null || echo "")
+        if echo "$ingress_managers" | grep -qw "manager"; then
+            log INFO "Operator owns langsmith-ingress — deleting to clear field ownership conflict..."
+            kubectl delete ingress langsmith-ingress -n "$NAMESPACE" 2>/dev/null || true
+        fi
+    fi
+
+    log INFO "Executing: ${helm_cmd}"
+
+    # Run helm in the background; redirect output to temp log
+    eval "$helm_cmd" > "$helm_log" 2>&1 &
+    local helm_pid=$!
+
+    log INFO "Helm running (PID ${helm_pid}) — pod status updates every 15s..."
+
+    # Kill helm and abort if unhealthy pods (CrashLoopBackOff/Error/OOMKilled) don't
+    # decrease for this many consecutive checks (~75s at 15s interval).
+    local stuck_threshold=5
+    local stuck_count=0
+    local last_bad=0
+    # Consider deployment done once all pods are Running for this many consecutive checks.
+    local stable_threshold=2
+    local stable_count=0
+    local last_summary=""
+
+    while kill -0 "$helm_pid" 2>/dev/null; do
+        sleep 15
+        kill -0 "$helm_pid" 2>/dev/null || break  # may have exited during sleep
+
+        local pod_output
+        pod_output=$(kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null) || pod_output=""
+
+        # Change-detection key: sorted status counts
+        local summary
+        summary=$(printf '%s' "$pod_output" | awk '{print $3}' | sort | uniq -c | tr '\n' '|') || summary=""
+
+        # Count pods by status
+        local total=0 running=0 completed=0 pending=0 bad=0 other=0
+        while IFS= read -r pod_line; do
+            [ -z "$pod_line" ] && continue
+            (( total++ )) || true
+            local pstatus
+            pstatus=$(printf '%s' "$pod_line" | awk '{print $3}')
+            case "$pstatus" in
+                Running)                    (( running++   )) || true ;;
+                Completed)                  (( completed++ )) || true ;;
+                Pending|Init:*)             (( pending++   )) || true ;;
+                CrashLoopBackOff|Error|\
+                OOMKilled|ImagePullBackOff|\
+                ErrImagePull)               (( bad++       )) || true ;;
+                *)                          (( other++     )) || true ;;
+            esac
+        done <<< "$pod_output"
+
+        # Stuck detection: kill helm if bad-pod count hasn't improved
+        if (( bad > 0 )); then
+            if (( bad >= last_bad )); then
+                (( stuck_count++ )) || true
+            else
+                stuck_count=0
+            fi
+            last_bad=$bad
+
+            if (( stuck_count >= stuck_threshold )); then
+                log ERROR "Deployment stuck: ${bad} pod(s) have been in a failed state for $((stuck_threshold * 15))s with no improvement."
+                log ERROR "Killing helm (PID ${helm_pid}) and aborting."
+                kill "$helm_pid" 2>/dev/null || true
+                cat "$helm_log"
+                rm -f "$helm_log"
+                return 1
+            fi
+        else
+            stuck_count=0
+            last_bad=0
+        fi
+
+        # Only reprint when something changed
+        [ "$summary" = "$last_summary" ] && continue
+        last_summary="$summary"
+
+        # Stability check: all pods Running with none in bad/pending/other states
+        if (( total > 0 && running == total && bad == 0 && pending == 0 && other == 0 )); then
+            (( stable_count++ )) || true
+            if (( stable_count >= stable_threshold )); then
+                log SUCCESS "All ${total} pods Running — deployment is stable. Proceeding."
+                kill "$helm_pid" 2>/dev/null || true
+                cat "$helm_log"
+                rm -f "$helm_log"
+                return 0
+            fi
+        else
+            stable_count=0
+        fi
+
+        local status_line="${running}/${total} Running"
+        (( completed > 0 )) && status_line+=", ${completed} Completed" || true
+        (( pending   > 0 )) && status_line+=", ${pending} Pending/Init" || true
+        (( bad       > 0 )) && status_line+=", ${bad} Failed [${stuck_count}/${stuck_threshold} checks]" || true
+        (( other     > 0 )) && status_line+=", ${other} Other" || true
+        log INFO "Pods: ${status_line}"
+
+        # Surface non-Running/non-Completed pods with truncated names
+        if (( bad > 0 || pending > 0 || other > 0 )); then
+            while IFS= read -r pod_line; do
+                [ -z "$pod_line" ] && continue
+                local pname pstatus
+                pname=$(printf '%s' "$pod_line" | awk '{print $1}')
+                pstatus=$(printf '%s' "$pod_line" | awk '{print $3}')
+                case "$pstatus" in Running|Completed) continue ;; esac
+                [ ${#pname} -gt 45 ] && pname="${pname:0:42}..."
+                log WARNING "  $(printf '%-45s %s' "$pname" "$pstatus")"
+            done <<< "$pod_output"
+        fi
+    done
+
+    # Capture helm exit code without letting set -e fire before we show output
+    local exit_code=0
+    wait "$helm_pid" || exit_code=$?
+    cat "$helm_log"
+    rm -f "$helm_log"
+
+    return "$exit_code"
+}
+
+##############################################################################
 setup_helm_repo() {
     log INFO "Setting up Helm repository..."
     
@@ -736,6 +917,16 @@ generate_secrets() {
         agentBuilderEncryptionKey=$(openssl rand -base64 32 | tr '+/' '-_')
     fi
 
+    # Generate Fernet-compatible encryption key for Insights
+    if [ -z "$insightsEncryptionKey" ]; then
+        insightsEncryptionKey=$(openssl rand -base64 32 | tr '+/' '-_')
+    fi
+
+    # Generate Fernet-compatible encryption key for Polly
+    if [ -z "$pollyEncryptionKey" ]; then
+        pollyEncryptionKey=$(openssl rand -base64 32 | tr '+/' '-_')
+    fi
+
     log SUCCESS "Secrets generated successfully"
 }
 
@@ -760,9 +951,12 @@ load_existing_secrets() {
     existing_jwt=$(grep --color=never -E '^\s*jwtSecret:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*jwtSecret:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
     existing_password=$(grep --color=never -E '^\s*initialOrgAdminPassword:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*initialOrgAdminPassword:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
 
-    # Also try to preserve Agent Builder encryption key if it exists
-    local existing_ab_key
-    existing_ab_key=$(grep --color=never -E '^\s*encryptionKey:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*encryptionKey:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
+    # Also try to preserve Agent Builder and Insights encryption keys if they exist
+    # encryptionKey appears under both agentBuilder and insights sections; grab both
+    local existing_ab_key existing_insights_key existing_polly_key
+    existing_ab_key=$(grep --color=never -A5 'agentBuilder:' "$LS_CONFIG_YAML" 2>/dev/null | grep --color=never 'encryptionKey:' | $SED_CMD 's/.*encryptionKey:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
+    existing_insights_key=$(grep --color=never -A5 'insights:' "$LS_CONFIG_YAML" 2>/dev/null | grep --color=never 'encryptionKey:' | $SED_CMD 's/.*encryptionKey:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
+    existing_polly_key=$(grep --color=never -A5 'polly:' "$LS_CONFIG_YAML" 2>/dev/null | grep --color=never 'encryptionKey:' | $SED_CMD 's/.*encryptionKey:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
 
     # Validate that all secrets exist and don't contain ANSI escape codes
     # Check for control characters that indicate corrupted values
@@ -781,6 +975,18 @@ load_existing_secrets() {
         if [ -n "$existing_ab_key" ]; then
             agentBuilderEncryptionKey="$existing_ab_key"
             log INFO "Preserved existing Agent Builder encryption key"
+        fi
+
+        # Preserve Insights encryption key if found
+        if [ -n "$existing_insights_key" ]; then
+            insightsEncryptionKey="$existing_insights_key"
+            log INFO "Preserved existing Insights encryption key"
+        fi
+
+        # Preserve Polly encryption key if found
+        if [ -n "$existing_polly_key" ]; then
+            pollyEncryptionKey="$existing_polly_key"
+            log INFO "Preserved existing Polly encryption key"
         fi
 
         log SUCCESS "Loaded existing secrets from ${LS_CONFIG_YAML}"
@@ -823,6 +1029,18 @@ create_langsmith_config() {
     if [ -z "$agentBuilderEncryptionKey" ]; then
         agentBuilderEncryptionKey=$(openssl rand -base64 32 | tr '+/' '-_')
         log INFO "Generated new Agent Builder encryption key"
+    fi
+
+    # Ensure Insights encryption key exists (may not be in older configs)
+    if [ -z "$insightsEncryptionKey" ]; then
+        insightsEncryptionKey=$(openssl rand -base64 32 | tr '+/' '-_')
+        log INFO "Generated new Insights encryption key"
+    fi
+
+    # Ensure Polly encryption key exists (may not be in older configs)
+    if [ -z "$pollyEncryptionKey" ]; then
+        pollyEncryptionKey=$(openssl rand -base64 32 | tr '+/' '-_')
+        log INFO "Generated new Polly encryption key"
     fi
 
     # Escape special characters for sed
@@ -941,11 +1159,9 @@ install_langsmith() {
         log INFO "Debug mode enabled"
     fi
     
-    log INFO "Executing: ${helm_cmd}"
-    
-    # Execute helm install
-    eval "$helm_cmd"
-    
+    # Execute helm install with live pod progress
+    helm_with_progress "$helm_cmd"
+
     log SUCCESS "LangSmith installed successfully"
 }
 
@@ -1408,9 +1624,27 @@ install_langsmith_deployment() {
         if [ -n "$LANGSMITH_HOSTNAME" ]; then
             ingress_hostname="$LANGSMITH_HOSTNAME"
             log INFO "Using user-specified hostname: ${ingress_hostname}"
-        # Priority 2: Try to get from existing ingress (for upgrades)
+        # Priority 2: Check existing ingress with short poll (gives ALB controller
+        # time to settle after a previous Helm upgrade before we read the hostname).
         elif ! is_minikube_cluster; then
-            ingress_hostname=$(get_ingress_hostname 2>/dev/null || echo "")
+            log INFO "Checking for existing ingress hostname..."
+            local alb_attempts=0
+            local alb_max=6
+            while [ $alb_attempts -lt $alb_max ]; do
+                ingress_hostname=$(kubectl get ingress -n "$NAMESPACE" \
+                    -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+                if [ -z "$ingress_hostname" ]; then
+                    ingress_hostname=$(kubectl get ingress -n "$NAMESPACE" \
+                        -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+                fi
+                if [ -n "$ingress_hostname" ] && [ "$ingress_hostname" != "<pending>" ]; then
+                    break
+                fi
+                alb_attempts=$((alb_attempts + 1))
+                log INFO "Waiting for ingress hostname... (attempt ${alb_attempts}/${alb_max})"
+                sleep 5
+            done
+            [ -n "$ingress_hostname" ] && log INFO "Found existing ingress hostname: ${ingress_hostname}"
             # Convert IP to nip.io if needed for nginx ingress
             if [ -n "$ingress_hostname" ] && [ "$ingress_hostname" != "<pending-ingress-hostname>" ] && [ "$INGRESS_TYPE" = "nginx" ]; then
                 if [[ "$ingress_hostname" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -1423,39 +1657,73 @@ install_langsmith_deployment() {
         # Priority 3: Fallback when no hostname is available
         local alb_patch_host=false
         if [ -z "$ingress_hostname" ] || [ "$ingress_hostname" = "<pending-ingress-hostname>" ]; then
-            # Agent Builder on Minikube: the listener health-checks the LGP endpoint via
-            # config.hostname. "localhost" resolves to 127.0.0.1 inside pods, which can't
-            # reach the ingress controller. Use the internal ingress service DNS instead.
             if [ "$INSTALL_AB" = true ] && is_minikube_cluster; then
+                # Minikube: use internal ingress DNS so the listener can health-check LGP pods
                 ingress_hostname="ingress-nginx-controller.ingress-nginx.svc.cluster.local"
                 log INFO "Using internal ingress hostname for Agent Builder on Minikube: ${ingress_hostname}"
+            elif [ "$INGRESS_TYPE" = "alb" ]; then
+                # ALB rejects 'localhost' (no dots) as an invalid listener rule condition.
+                # Phase 1: install basic LangSmith (no deployment features) to provision the ALB.
+                # Phase 2: upgrade with the real ALB hostname and all features.
+                log INFO "ALB cluster with no existing hostname — running two-phase deploy to provision ALB first..."
+                local phase1_cmd="helm upgrade --install langsmith langchain/langsmith"
+                phase1_cmd+=" --namespace \"${NAMESPACE}\""
+                phase1_cmd+=" --values \"${LS_CONFIG_YAML}\""
+                phase1_cmd+=" --wait=false --timeout 10m --hide-notes"
+                phase1_cmd+=" --set operator.createCRDs=false"
+                phase1_cmd+=" --set operator.watchNamespaces=${NAMESPACE}"
+                phase1_cmd+=" --set frontend.service.type=ClusterIP"
+                [ "$DEBUG" = true ] && phase1_cmd+=" --debug"
+                if [ -n "$VERSION" ]; then phase1_cmd+=" --version ${VERSION}"; fi
+                log INFO "Phase 1: installing base LangSmith to provision ALB..."
+                helm_with_progress "$phase1_cmd"
+                log INFO "Waiting for ALB hostname to be assigned (this may take 2-5 minutes)..."
+                ingress_hostname=$(get_ingress_hostname)
+                if [ -z "$ingress_hostname" ] || [ "$ingress_hostname" = "<pending-ingress-hostname>" ]; then
+                    log ERROR "ALB hostname was not assigned after waiting. Set LANGSMITH_HOSTNAME in .env and re-run."
+                    exit 1
+                fi
+                log SUCCESS "ALB hostname provisioned: ${ingress_hostname}"
+                log INFO "Phase 2: upgrading with deployment features and real hostname..."
             else
                 ingress_hostname="localhost"
                 log INFO "Using default hostname: localhost (use port-forward to access)"
             fi
         fi
         
-        # Add deployment section to ls_config.yaml for LangSmith chart
-        local temp_insert=$(mktemp)
-        if [ "$INSTALL_AB" = true ]; then
-            # Include Agent Builder config (v0.13+) alongside deployment
-            log INFO "Adding config.deployment.enabled, config.hostname, and config.agentBuilder to LangSmith config"
-            cat > "$temp_insert" << EOF
-  deployment:
-    enabled: true
-  hostname: "${ingress_hostname}"
-  agentBuilder:
-    enabled: true
-    encryptionKey: "${agentBuilderEncryptionKey}"
-EOF
-        else
-            log INFO "Adding config.deployment.enabled and config.hostname to LangSmith config"
-            cat > "$temp_insert" << EOF
-  deployment:
-    enabled: true
-  hostname: "${ingress_hostname}"
-EOF
-        fi
+        # Enable deployment in the config (deployment block already exists in config.yaml
+        # with enabled: false — flip it to true to avoid duplicate YAML keys).
+        local features_enabled=()
+        [ "$INSTALL_AB" = true ]       && features_enabled+=("agentBuilder")
+        [ "$INSTALL_INSIGHTS" = true ] && features_enabled+=("insights")
+        [ "$INSTALL_POLLY" = true ]    && features_enabled+=("polly")
+        log INFO "Enabling config.deployment, setting config.hostname${features_enabled:+, $(IFS=', '; echo "${features_enabled[*]}")} in LangSmith config"
+
+        # Flip deployment.enabled false -> true (scoped to the line after 'deployment:')
+        $SED_CMD -i.bak '/^  deployment:$/{n; s/enabled: false/enabled: true/}' "$LS_CONFIG_YAML"
+        rm -f "${LS_CONFIG_YAML}.bak"
+
+        # Inject hostname and optional feature configs after 'config:' line
+        local temp_insert
+        temp_insert=$(mktemp)
+        {
+            echo "  hostname: \"${ingress_hostname}\""
+            if [ "$INSTALL_AB" = true ]; then
+                echo "  agentBuilder:"
+                echo "    enabled: true"
+                echo "    encryptionKey: \"${agentBuilderEncryptionKey}\""
+            fi
+            if [ "$INSTALL_INSIGHTS" = true ]; then
+                echo "  insights:"
+                echo "    enabled: true"
+                echo "    encryptionKey: \"${insightsEncryptionKey}\""
+            fi
+            if [ "$INSTALL_POLLY" = true ]; then
+                echo "  polly:"
+                echo "    enabled: true"
+                echo "    encryptionKey: \"${pollyEncryptionKey}\""
+            fi
+        } > "$temp_insert"
         $SED_CMD -i.bak "/^config:/r $temp_insert" "$LS_CONFIG_YAML"
         rm -f "$temp_insert" "${LS_CONFIG_YAML}.bak"
         
@@ -1501,10 +1769,16 @@ EOF
             helm_cmd+=" --set frontend.service.type=ClusterIP"
         fi
 
-        # Enable Agent Builder components if requested (v0.13+)
+        # Enable Agent Builder and Insights components if requested (v0.13+)
         if [ "$INSTALL_AB" = true ]; then
             helm_cmd+=" --set agentBuilderToolServer.enabled=true"
             helm_cmd+=" --set agentBuilderTriggerServer.enabled=true"
+            if [ "$INSTALL_INSIGHTS" = true ]; then
+                helm_cmd+=" --set config.insights.enabled=true"
+            fi
+            if [ "$INSTALL_POLLY" = true ]; then
+                helm_cmd+=" --set config.polly.enabled=true"
+            fi
             if is_minikube_cluster; then
                 helm_cmd+=" --set config.tlsEnabled=false"
                 # Disable ingress health check: the listener health-checks LGP pods
@@ -1526,8 +1800,28 @@ EOF
             helm_cmd+=" --debug"
         fi
 
-        log INFO "Executing: ${helm_cmd}"
-        eval "$helm_cmd"
+        # Execute helm upgrade with live pod progress
+        helm_with_progress "$helm_cmd"
+
+        # After Helm upgrade, verify the ingress host rule matches the actual ALB.
+        # The ALB controller may assign a different DNS than what was in the config
+        # (e.g., after ALB recreation or listener reconfiguration).
+        if [ "$INGRESS_TYPE" = "alb" ]; then
+            local actual_alb_host spec_host
+            actual_alb_host=$(kubectl get ingress langsmith-ingress -n "$NAMESPACE" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            spec_host=$(kubectl get ingress langsmith-ingress -n "$NAMESPACE" \
+                -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo "")
+            if [ -n "$actual_alb_host" ] && [ -n "$spec_host" ] && [ "$actual_alb_host" != "$spec_host" ]; then
+                log WARNING "ALB hostname mismatch: spec.rules.host=${spec_host} but actual ALB=${actual_alb_host}"
+                log INFO "Updating config hostname and re-running Helm upgrade..."
+                $SED_CMD -i.bak "s|${spec_host}|${actual_alb_host}|g" "$LS_CONFIG_YAML"
+                rm -f "${LS_CONFIG_YAML}.bak"
+                helm_with_progress "$helm_cmd"
+                log SUCCESS "Ingress host rule now matches actual ALB hostname"
+            fi
+        fi
+
         if [ "$INSTALL_AB" = true ]; then
             if is_minikube_cluster; then
                 log SUCCESS "Phase 1 complete: core components installed"
@@ -1562,6 +1856,12 @@ EOF
                 helm_cmd2+=" --set backend.agentBootstrap.enabled=true"
                 helm_cmd2+=" --set agentBuilderToolServer.enabled=true"
                 helm_cmd2+=" --set agentBuilderTriggerServer.enabled=true"
+                if [ "$INSTALL_INSIGHTS" = true ]; then
+                    helm_cmd2+=" --set config.insights.enabled=true"
+                fi
+                if [ "$INSTALL_POLLY" = true ]; then
+                    helm_cmd2+=" --set config.polly.enabled=true"
+                fi
                 helm_cmd2+=" --set config.tlsEnabled=false"
                 helm_cmd2+=" --set config.deployment.ingressHealthCheckEnabled=false"
                 helm_cmd2+=" --set operator.kedaEnabled=false"
