@@ -6,6 +6,13 @@
 config:
   # hostname: Added dynamically by smith-fly.sh when deployment is enabled (v12+).
   #   Override with LANGSMITH_HOSTNAME in .env for custom domain.
+  deployment:
+    enabled: false  # toggled to true dynamically by smith-fly.sh for -ld* flags
+    ingressHealthCheckEnabled: false
+    # If we have tlsEnabled set to false you will need to manually edit ConfigMap langsmith-agent-builder-config
+    # VITE_AGENT_BUILDER_MCP_SERVER_URL and VITE_AGENT_BUILDER_HOST_BACKEND_URL
+    # to use http instead of https and point to the correct hostname.
+    tlsEnabled: false
   langsmithLicenseKey: ""
   apiKeySalt: ""
   authType: "mixed"

@@ -9,6 +9,7 @@ Automated installation and management tool for LangSmith, LangSmith Deployment, 
 This script automates the deployment of LangSmith, LangSmith Deployment, and Agent Builder to Kubernetes clusters for **testing and development purposes**. It provides a quick way to spin up environments for reproduction, debugging, and evaluation across multiple cloud providers and on-premise environments.
 
 Key capabilities:
+
 - Configuration generation with secure secrets
 - Helm chart installation and upgrades
 - Custom namespace support (`-n` flag) with DNS label validation
@@ -20,6 +21,9 @@ Key capabilities:
 - Shared cluster support (multiple installations without CRD conflicts)
 - Agent Builder support (`-lda` flag, chart v0.13+) with two-phase Minikube install
 - Post-install synthetic data population (append `s` to any flag, e.g. `-ls`, `-lds`, `-ldas`) with traces, feedback, datasets, and prompts
+- Add-on support (chart v0.13+): Agent Builder (`a`), Insights (`i`), Polly (`p`) via combinable `-ld`* flags
+- Live pod-status progress during Helm installs (updates every 15s with stuck-pod detection)
+- Two-phase ALB deploy: auto-provisions ALB hostname before enabling deployment features
 
 ## Requirements
 
@@ -34,8 +38,8 @@ Example of [Minikube script](https://github.com/langchain-ai/smith-utils/blob/ma
 ### Kubernetes Cluster
 
 - A running Kubernetes cluster with:
-  - **CPU**: ~4 cores available (~10 cores for `-lda`)
-  - **Memory**: ~8Gi available (~12Gi for `-lda`)
+  - **CPU**: ~~4 cores available (~~10 cores for `-lda` and add-ons)
+  - **Memory**: ~~8Gi available (~~12Gi for `-lda` and add-ons)
   - Ingress controller configured:
     - **AWS EKS**: ALB Ingress Controller (auto-detected)
     - **Non-AWS**: nginx-ingress controller (auto-detected)
@@ -44,19 +48,26 @@ Example of [Minikube script](https://github.com/langchain-ai/smith-utils/blob/ma
 ### Configuration Files
 
 - `config/.env` - Environment file containing license key and admin email:
+
 ```
 initialOrgAdminEmail="admin@example.com"
 LicenseKey="your-license-key-here"
 # Optional: Custom hostname for LangSmith (leave empty for auto-detection)
 # LANGSMITH_HOSTNAME="langsmith.example.com"
 ```
+
 **Note:** The `.env` file should not be committed to version control. Add it to `.gitignore` to keep sensitive information secure.
 
 - `config/config.yaml` - Base Helm values configuration
 
 **Example `config/config.yaml` structure:**
+
 ```yaml
 config:
+  deployment:
+    enabled: false            # Toggled to true by script for -ld* flags
+    ingressHealthCheckEnabled: false
+    tlsEnabled: false
   langsmithLicenseKey: ""     # Will be populated by script
   apiKeySalt: ""              # Will be populated by script
   jwtSecret: ""               # Will be populated by script
@@ -64,12 +75,22 @@ config:
   initialOrgAdminPassword: "" # Will be populated by script
 ```
 
-For LangSmith Deployment, the script adds:
+For LangSmith Deployment, the script dynamically enables `config.deployment` and injects `config.hostname`. Add-ons (Agent Builder, Insights, Polly) each get their own block with an auto-generated Fernet encryption key:
+
 ```yaml
 config:
-  langgraphPlatform:
+  deployment:
     enabled: true
-    langgraphPlatformLicenseKey: "your-key"  # Automatically populated
+  hostname: "auto-detected-or-custom"
+  agentBuilder:              # -lda
+    enabled: true
+    encryptionKey: "..."
+  insights:                  # -ldi
+    enabled: true
+    encryptionKey: "..."
+  polly:                     # -ldp
+    enabled: true
+    encryptionKey: "..."
 ```
 
 ## Usage
@@ -111,6 +132,15 @@ config:
 # Install LangSmith Deployment + Agent Builder (requires chart v0.13+)
 ./smith-fly.sh up -lda
 
+# Install LangSmith Deployment + Insights
+./smith-fly.sh up -ldi
+
+# Install LangSmith Deployment + Polly
+./smith-fly.sh up -ldp
+
+# Install LangSmith Deployment + Agent Builder + Insights + Polly (all add-ons)
+./smith-fly.sh up -ldaip
+
 # Uninstall LangSmith from ALL namespaces (auto-discovers deployments)
 ./smith-fly.sh down
 
@@ -121,10 +151,10 @@ config:
 ### Command Options
 
 ```
-Usage: ./smith-fly.sh <up|down|status> [-l|-ls|-ld|-lds|-lda|-ldas] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
+Usage: ./smith-fly.sh <up|down|status> [-l|-ls|-ld|-lds|-ld[a][i][p]] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
 
 Actions:
-    up      Spin up/install LangSmith, LangSmith Deployment, or Agent Builder
+    up      Spin up/install LangSmith, LangSmith Deployment, or add-ons
     down    Remove LangSmith from all namespaces (or a specific one with -n)
     status  Check installation status of LangSmith and LangSmith Deployment
 
@@ -138,7 +168,16 @@ Options:
     -v        Specify version (optional)
     -n        Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i        Ingress type: alb or nginx (auto-detected if not specified)
-    --debug   Enable Helm debug output (optional)
+    -l              Install LangSmith (tracing, eval, playground)
+    -ld             Install LangSmith Deployment (adds LangGraph deployment to -l)
+    -ld[a][i][p]    Install LangSmith Deployment with optional add-ons (v0.13+):
+                      a = Agent Builder (no-code agent creation)
+                      i = Insights
+                      p = Polly
+                    Letters combine freely: -lda -ldi -ldp -ldai -ldip -ldaip
+    -v              Specify version (optional)
+    -n              Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
+    -i              Ingress type: alb or nginx (auto-detected if not specified)
 ```
 
 > **Namespace rules**: The `-n` value must start with a lowercase letter (`a-z`), contain only lowercase alphanumeric characters or hyphens, and be at most 63 characters. Purely numeric namespaces (e.g., `15265`) are rejected because they cause Helm YAML serialization errors. Use a prefixed name instead (e.g., `ls-15265`).
@@ -168,6 +207,7 @@ Ingress:   http://192.168.49.2.nip.io
 ### Configuration Setup
 
 1. Create `config/.env` file:
+
 ```bash
 cat > config/.env << EOF
 initialOrgAdminEmail="admin@example.com"
@@ -175,169 +215,11 @@ LicenseKey="your-license-key-here"
 EOF
 ```
 
-2. Create `config/config.yaml` with base Helm values (see LangChain documentation for Self-Hosted [LangSmith](https://docs.langchain.com/langsmith/kubernetes) and [LangSmith Deployment](https://docs.langchain.com/langgraph-platform/deploy-self-hosted-full-platform))
+1. Create `config/config.yaml` with base Helm values (see LangChain documentation for Self-Hosted [LangSmith](https://docs.langchain.com/langsmith/kubernetes) and [LangSmith Deployment](https://docs.langchain.com/langgraph-platform/deploy-self-hosted-full-platform))
+2. Run the script:
 
-3. Run the script:
 ```bash
 ./smith-fly.sh up -l
-```
-
-## Troubleshooting
-
-### Check Pod Status
-
-```bash
-# List all pods in your namespace
-kubectl get pods -n <namespace>
-
-# Describe a specific pod
-kubectl describe pod <pod-name> -n <namespace>
-
-# View pod logs
-kubectl logs <pod-name> -n <namespace>
-
-# Follow logs in real-time
-kubectl logs -f <pod-name> -n <namespace>
-```
-
-### Check Services
-
-```bash
-# List all services
-kubectl get svc -n <namespace>
-
-# Describe a specific service
-kubectl describe svc <service-name> -n <namespace>
-```
-
-### Check Ingress
-
-```bash
-# List ingress resources
-kubectl get ingress -n <namespace>
-
-# Describe ingress
-kubectl describe ingress -n <namespace>
-
-# Get ingress endpoint
-kubectl get ingress -n <namespace> -o jsonpath='{.items[0].status.loadBalancer.ingress[0]}'
-```
-
-### Check Persistent Volumes
-
-```bash
-# List PVCs in namespace
-kubectl get pvc -n <namespace>
-
-# Check PVC details
-kubectl describe pvc <pvc-name> -n <namespace>
-```
-
-### Common Issues
-
-#### Pods Not Starting
-
-```bash
-# Check events
-kubectl get events -n <namespace> --sort-by='.lastTimestamp'
-
-# Check resource availability
-kubectl top nodes
-kubectl top pods -n <namespace>
-```
-
-#### Ingress Not Working
-
-```bash
-# Verify ingress controller is running
-# For nginx ingress:
-kubectl get pods -n ingress-nginx
-
-# For AWS ALB ingress:
-kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
-
-# Check available ingress classes
-kubectl get ingressclass
-
-# Verify ingress resource
-kubectl get ingress -n <namespace> -o yaml
-```
-
-#### ClusterRole Ownership Conflict
-
-If you see an error like:
-```
-ClusterRole "langsmith-operator" in namespace "" exists and cannot be imported into the current release:
-invalid ownership metadata; annotation validation error: key "meta.helm.sh/release-namespace" must equal "<your-namespace>": current value is "<other-namespace>"
-```
-
-This means another LangSmith Helm release on the cluster already owns the cluster-scoped `ClusterRole`. The script handles this automatically by setting `operator.watchNamespaces` to scope RBAC to your namespace. If you hit this on an older version of the script, update and re-run.
-
-#### Endpoint Shows PENDING (ALB)
-
-If the endpoint shows `PENDING` after installation on AWS EKS, the ALB may have failed to provision:
-
-```bash
-# Check ingress events for errors
-kubectl get events -n <namespace> --field-selector involvedObject.name=langsmith-ingress
-
-# Check if ALB controller is running
-kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
-```
-
-Common causes:
-- **Invalid host condition**: ALB rejects `localhost` or other non-FQDN hostnames. The script handles this automatically for new installs by patching the ingress. For existing installs, set `LANGSMITH_HOSTNAME` in `config/.env` to a valid domain, or manually remove the host rule:
-  ```bash
-  kubectl patch ingress langsmith-ingress -n <namespace> --type=json \
-      -p='[{"op":"remove","path":"/spec/rules/0/host"}]'
-  ```
-- **Missing ALB controller**: Ensure the AWS Load Balancer Controller is installed on the cluster.
-- **IAM permissions**: The ALB controller needs permissions to create load balancers.
-
-#### Database Connection Issues
-
-```bash
-# Check PostgreSQL pod
-kubectl logs -l app.kubernetes.io/name=postgresql -n <namespace>
-
-# Check Redis pod
-kubectl logs -l app.kubernetes.io/name=redis -n <namespace>
-```
-
-### Get Namespace Name
-
-By default, the script auto-generates a namespace from your hostname. You can override this with the `-n` flag:
-```bash
-# See the auto-generated namespace
-hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-'
-
-# Or use a custom namespace
-./smith-fly.sh status -n my-namespace
-```
-
-### Manual Cleanup
-
-If `./smith-fly.sh down` fails:
-```bash
-# Option 1: Remove from a specific namespace
-NAMESPACE="my-namespace"
-
-# Option 2: Use auto-generated namespace
-NAMESPACE=$(hostname | tr '[:upper:]' '[:lower:]' | tr '.' '-')
-
-# Uninstall Helm release
-helm uninstall langsmith -n $NAMESPACE
-
-# Delete PVCs
-kubectl delete pvc --all -n $NAMESPACE
-
-# Delete namespace
-kubectl delete namespace $NAMESPACE
-```
-
-To find all namespaces with LangSmith deployments:
-```bash
-helm list --all-namespaces --filter '^langsmith$'
 ```
 
 ## Resource Usage
@@ -367,6 +249,7 @@ frontend:
 ## Platform Compatibility
 
 ✅ **Supported Platforms:**
+
 - AWS (EKS)
 - Google Cloud (GKE)
 - Azure (AKS)
@@ -397,11 +280,13 @@ The script supports deploying multiple LangSmith installations in different name
 
 The script **auto-detects** the cluster type and configures the appropriate ingress:
 
-| Cluster Type | Ingress Type | Auto-Detection |
-|--------------|--------------|----------------|
-| **AWS EKS** | ALB | Detected via `eks.amazonaws.com` labels or `aws://` provider ID |
-| **Minikube** | nginx | Auto port-forward to localhost, KEDA CRDs auto-detected |
-| **Other clusters** | nginx | Default for GKE, AKS, on-premise, k3s, etc. |
+
+| Cluster Type       | Ingress Type | Auto-Detection                                                  |
+| ------------------ | ------------ | --------------------------------------------------------------- |
+| **AWS EKS**        | ALB          | Detected via `eks.amazonaws.com` labels or `aws://` provider ID |
+| **Minikube**       | nginx        | Auto port-forward to localhost, KEDA CRDs auto-detected         |
+| **Other clusters** | nginx        | Default for GKE, AKS, on-premise, k3s, etc.                     |
+
 
 Use the `-i` flag to override auto-detection if needed:
 
@@ -411,6 +296,7 @@ Use the `-i` flag to override auto-detection if needed:
 ```
 
 **ALB Ingress (AWS EKS):**
+
 ```yaml
 ingress:
   ingressClassName: alb
@@ -419,9 +305,12 @@ ingress:
     alb.ingress.kubernetes.io/target-type: ip
 ```
 
-When deploying with LangSmith Deployment (`-ld`) on ALB and no `LANGSMITH_HOSTNAME` is set, the script uses a placeholder hostname to satisfy chart validation, then patches the ingress to remove the host rule so the ALB accepts all traffic. The endpoint will be the auto-generated ALB DNS name (e.g., `k8s-testns-langsmit-xxxx.us-east-1.elb.amazonaws.com`). To use a custom domain instead, set `LANGSMITH_HOSTNAME` in `config/.env`.
+When deploying with LangSmith Deployment (`-ld*`) on ALB and no `LANGSMITH_HOSTNAME` is set, the script runs a two-phase deploy: Phase 1 installs base LangSmith to provision the ALB, then Phase 2 upgrades with the real ALB hostname and all deployment features. The endpoint will be the auto-generated ALB DNS name (e.g., `k8s-testns-langsmit-xxxx.us-east-1.elb.amazonaws.com`). To use a custom domain instead, set `LANGSMITH_HOSTNAME` in `config/.env`.
+
+On subsequent upgrades, the script preserves the existing ALB by patching `managedFields` instead of deleting the ingress, preventing ALB re-creation and DNS hostname changes.
 
 **nginx Ingress (Non-AWS):**
+
 ```yaml
 ingress:
   ingressClassName: nginx
@@ -434,12 +323,13 @@ The script automatically detects ingress endpoints using both hostname (AWS) and
 
 - Admin passwords are automatically generated with required symbols
 - Secrets are generated using OpenSSL with 32-byte entropy
-- Agent Builder Fernet encryption key is auto-generated and preserved across upgrades
+- Fernet encryption keys for Agent Builder, Insights, and Polly are auto-generated and preserved across upgrades
 - Credentials are displayed once after installation - save them securely
 - Configuration files containing secrets are created locally - handle with care
 - When deploying LangSmith Deployment on top of an existing LangSmith installation (`up -ld` after `up -l`), secrets are automatically preserved from the existing configuration to ensure consistency
 
 **Production Deployments**: For production use, please follow the official LangChain deployment guides which include:
+
 - Proper secret management (e.g., HashiCorp Vault, AWS Secrets Manager)
 - TLS/SSL termination
 - High availability configuration
@@ -464,30 +354,37 @@ smith-fly/
 ```
 
 **Important:** The `.gitignore` file is configured to exclude:
+
 - `config/.env` - Contains sensitive credentials
 - `config/ls_config.yaml` - Generated configuration with secrets
 
 ## TODO
 
-- [ ] Support TLS/SSL for ingress
-- [x] Support custom namespace names (via `-n` flag with DNS label validation)
-- [x] Multi-namespace teardown (`down` auto-discovers all LangSmith deployments)
-- [x] Add installation status check (`status` action)
-- [x] Support multiple ingress types (ALB/nginx via `-i` flag)
-- [x] Auto-detect cluster type for ingress (EKS -> ALB, others -> nginx)
-- [x] Configure replicas in `config.yaml` (default: 1 per component)
-- [x] Support shared clusters (automatic CRD and ClusterRole conflict handling)
-- [x] Preserve secrets when upgrading LangSmith to LangSmith Deployment
-- [x] ALB hostname fix (auto-patch ingress when no custom hostname is set)
-- [x] Minikube support with auto port-forward and KEDA detection
-- [x] Minimal resource configuration for local development
-- [x] Agent Builder support (`-lda` flag) with two-phase Minikube install
-- [x] Known-bad version range detection (0.13.17–0.13.22 bootstrap regression)
-- [x] Improved teardown (LGP CRD cleanup, all PVCs, released PV cleanup)
-- [ ] Support external database configuration
-- [ ] Add metrics collection integration
-- [ ] Support air-gapped installations
-
+- Support TLS/SSL for ingress
+- Support custom namespace names (via `-n` flag with DNS label validation)
+- Multi-namespace teardown (`down` auto-discovers all LangSmith deployments)
+- Add installation status check (`status` action)
+- Support multiple ingress types (ALB/nginx via `-i` flag)
+- Auto-detect cluster type for ingress (EKS -> ALB, others -> nginx)
+- Configure replicas in `config.yaml` (default: 1 per component)
+- Support shared clusters (automatic CRD and ClusterRole conflict handling)
+- Preserve secrets when upgrading LangSmith to LangSmith Deployment
+- ALB hostname fix (auto-patch ingress when no custom hostname is set)
+- Minikube support with auto port-forward and KEDA detection
+- Minimal resource configuration for local development
+- Agent Builder support (`-lda` flag) with two-phase Minikube install
+- Insights add-on support (`-ldi` flag, v0.13+)
+- Polly add-on support (`-ldp` flag, v0.13+)
+- Combinable add-on flags (`-ldaip` for all add-ons at once)
+- Live pod-status progress during Helm installs (stuck-pod detection)
+- Two-phase ALB deploy (auto-provisions ALB before enabling deployment)
+- ALB ingress preservation via managedFields patch (no ALB re-creation on upgrades)
+- Deployment block in `config.yaml` with disabled defaults
+- Known-bad version range detection (0.13.17–0.13.22 bootstrap regression)
+- Improved teardown (LGP CRD cleanup, all PVCs, released PV cleanup)
+- Support external database configuration
+- Add metrics collection integration
+- Support air-gapped installations
 
 ## License
 
@@ -496,7 +393,9 @@ This script is provided as-is for **testing and development purposes only**. It 
 ## Support
 
 For issues related to:
+
 - **Script functionality**: Check troubleshooting section above
 - **LangSmith/LangSmith Deployment**: Consult [LangChain documentation](https://docs.smith.langchain.com/) for Self-Hosted [LangSmith](https://docs.langchain.com/langsmith/kubernetes) and [LangSmith Deployment](https://docs.langchain.com/langgraph-platform/deploy-self-hosted-full-platform)
 - **Kubernetes**: Check your cluster provider documentation
 - [LangChain Support portal](https://support.langchain.com/)
+
