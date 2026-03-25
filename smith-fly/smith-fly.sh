@@ -750,17 +750,26 @@ helm_with_progress() {
         fi
     fi
 
-    # Delete the ingress only when the operator's field manager ("manager") owns
-    # .spec.rules — Helm's apply conflicts with that ownership and fails.
-    # Skipping deletion when the operator hasn't touched the ingress avoids
-    # forcing the ALB controller to provision a new ALB with a new hostname.
+    # The operator ("manager") takes ownership of spec.rules on the ingress,
+    # which conflicts with Helm's apply. Instead of deleting the ingress (which
+    # forces the ALB controller to provision a new ALB with a new DNS hostname),
+    # use server-side apply to let Helm reclaim field ownership non-destructively.
     if kubectl get ingress langsmith-ingress -n "$NAMESPACE" &>/dev/null; then
         local ingress_managers
         ingress_managers=$(kubectl get ingress langsmith-ingress -n "$NAMESPACE" \
             -o jsonpath='{.metadata.managedFields[*].manager}' 2>/dev/null || echo "")
         if echo "$ingress_managers" | grep -qw "manager"; then
-            log INFO "Operator owns langsmith-ingress — deleting to clear field ownership conflict..."
-            kubectl delete ingress langsmith-ingress -n "$NAMESPACE" 2>/dev/null || true
+            log INFO "Operator owns langsmith-ingress — clearing field ownership to avoid conflict..."
+            kubectl get ingress langsmith-ingress -n "$NAMESPACE" -o json \
+                | python3 -c "
+import sys, json
+obj = json.load(sys.stdin)
+obj['metadata']['managedFields'] = [
+    m for m in obj['metadata'].get('managedFields', [])
+    if m.get('manager') != 'manager'
+]
+json.dump(obj, sys.stdout)" \
+                | kubectl apply -f - 2>/dev/null || true
         fi
     fi
 
@@ -793,12 +802,16 @@ helm_with_progress() {
         local summary
         summary=$(printf '%s' "$pod_output" | awk '{print $3}' | sort | uniq -c | tr '\n' '|') || summary=""
 
-        # Count pods by status
+        # Count pods by status. Operator-managed pods (smith-*, lg-*) are excluded
+        # from the "bad" count because the operator continuously reconciles them and
+        # old ReplicaSet pods can linger in Error during rollouts while new pods are
+        # already Running.
         local total=0 running=0 completed=0 pending=0 bad=0 other=0
         while IFS= read -r pod_line; do
             [ -z "$pod_line" ] && continue
             (( total++ )) || true
-            local pstatus
+            local pname pstatus
+            pname=$(printf '%s' "$pod_line" | awk '{print $1}')
             pstatus=$(printf '%s' "$pod_line" | awk '{print $3}')
             case "$pstatus" in
                 Running)                    (( running++   )) || true ;;
@@ -806,7 +819,13 @@ helm_with_progress() {
                 Pending|Init:*)             (( pending++   )) || true ;;
                 CrashLoopBackOff|Error|\
                 OOMKilled|ImagePullBackOff|\
-                ErrImagePull)               (( bad++       )) || true ;;
+                ErrImagePull)
+                    if [[ "$pname" =~ ^(smith-|lg-|clio-|agent-builder-) ]]; then
+                        (( other++ )) || true
+                    else
+                        (( bad++ )) || true
+                    fi
+                    ;;
                 *)                          (( other++     )) || true ;;
             esac
         done <<< "$pod_output"
@@ -1803,9 +1822,10 @@ install_langsmith_deployment() {
         # Execute helm upgrade with live pod progress
         helm_with_progress "$helm_cmd"
 
-        # After Helm upgrade, verify the ingress host rule matches the actual ALB.
-        # The ALB controller may assign a different DNS than what was in the config
-        # (e.g., after ALB recreation or listener reconfiguration).
+        # Safety net: verify the ingress host rule matches the actual ALB DNS.
+        # With the ingress preserved across upgrades (no deletion), the ALB DNS
+        # should be stable. This check catches edge cases where a mismatch
+        # persists from a previous deployment.
         if [ "$INGRESS_TYPE" = "alb" ]; then
             local actual_alb_host spec_host
             actual_alb_host=$(kubectl get ingress langsmith-ingress -n "$NAMESPACE" \
@@ -1814,7 +1834,7 @@ install_langsmith_deployment() {
                 -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || echo "")
             if [ -n "$actual_alb_host" ] && [ -n "$spec_host" ] && [ "$actual_alb_host" != "$spec_host" ]; then
                 log WARNING "ALB hostname mismatch: spec.rules.host=${spec_host} but actual ALB=${actual_alb_host}"
-                log INFO "Updating config hostname and re-running Helm upgrade..."
+                log INFO "Updating config hostname and re-running Helm upgrade to fix ROOT_DOMAIN..."
                 $SED_CMD -i.bak "s|${spec_host}|${actual_alb_host}|g" "$LS_CONFIG_YAML"
                 rm -f "${LS_CONFIG_YAML}.bak"
                 helm_with_progress "$helm_cmd"
