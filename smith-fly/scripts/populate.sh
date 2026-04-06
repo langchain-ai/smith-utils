@@ -272,29 +272,44 @@ do_login() {
     local auth_header
     auth_header=$(printf '%s:%s' "$EMAIL" "$PASSWORD" | base64)
 
-    local response
-    response=$(curl -s -w "\n%{http_code}" \
-        -X POST "${ENDPOINT}/api/v1/login" \
-        -H "Authorization: Basic ${auth_header}" \
-        -H "Content-Type: application/json" \
-        2>/dev/null) || true
+    local max_retries=6
+    local retry_interval=5
+    local response http_code body
 
-    local http_code
-    http_code=$(echo "$response" | tail -1)
-    local body
-    body=$(echo "$response" | sed '$d')
+    for i in $(seq 1 $max_retries); do
+        response=$(curl -s -w "\n%{http_code}" \
+            -X POST "${ENDPOINT}/api/v1/login" \
+            -H "Authorization: Basic ${auth_header}" \
+            -H "Content-Type: application/json" \
+            2>/dev/null) || true
 
-    if [ "$http_code" != "200" ]; then
+        http_code=$(echo "$response" | tail -1)
+        body=$(echo "$response" | sed '$d')
+
+        if [ "$http_code" = "200" ]; then
+            JWT_TOKEN=$(echo "$body" | json_val '.access_token')
+            if [ -z "$JWT_TOKEN" ] || [ "$JWT_TOKEN" = "null" ]; then
+                log ERROR "Login succeeded but no access_token in response."
+                exit 1
+            fi
+            return 0
+        fi
+
+        # 401 on fresh install likely means the initial user hasn't been seeded yet
+        if [ "$http_code" = "401" ] && [ "$i" -lt "$max_retries" ]; then
+            log WARNING "Login returned 401 — user may not be seeded yet, retrying in ${retry_interval}s... (${i}/${max_retries})"
+            sleep "$retry_interval"
+            continue
+        fi
+
         log ERROR "Login failed (HTTP ${http_code}) — check email/password."
         log ERROR "Response: ${body}"
         exit 1
-    fi
+    done
 
-    JWT_TOKEN=$(echo "$body" | json_val '.access_token')
-    if [ -z "$JWT_TOKEN" ] || [ "$JWT_TOKEN" = "null" ]; then
-        log ERROR "Login succeeded but no access_token in response."
-        exit 1
-    fi
+    log ERROR "Login failed after ${max_retries} attempts (HTTP ${http_code})."
+    log ERROR "Response: ${body}"
+    exit 1
 }
 
 # ==============================================================================

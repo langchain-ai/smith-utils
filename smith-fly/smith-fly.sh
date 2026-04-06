@@ -510,6 +510,13 @@ parse_arguments() {
                 POPULATE=true
                 shift
                 ;;
+            # Must precede -ld*: -ldas matches -ld* first and suffix "as" fails [^aip] validation.
+            -ldas)
+                INSTALL_LD=true
+                INSTALL_AB=true
+                POPULATE=true
+                shift
+                ;;
             -ld*)
                 local suffix="${1#-ld}"
                 # Validate suffix contains only valid feature letters: a, i, p
@@ -521,12 +528,6 @@ parse_arguments() {
                 [[ "$suffix" == *"a"* ]] && INSTALL_AB=true
                 [[ "$suffix" == *"i"* ]] && INSTALL_INSIGHTS=true
                 [[ "$suffix" == *"p"* ]] && INSTALL_POLLY=true
-                shift
-                ;;
-            -ldas)
-                INSTALL_LD=true
-                INSTALL_AB=true
-                POPULATE=true
                 shift
                 ;;
             -v)
