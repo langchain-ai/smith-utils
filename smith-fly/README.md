@@ -19,6 +19,8 @@ Key capabilities:
 - Clean uninstallation for resource cleanup (single namespace or all at once)
 - LangSmith Deployments UI enabled by default (shows in LangSmith menu)
 - Shared cluster support (multiple installations without CRD conflicts)
+- Agent Builder support (`-lda` flag, chart v0.13+) with two-phase Minikube install
+- Post-install synthetic data population (append `s` to any flag, e.g. `-ls`, `-lds`, `-ldas`) with traces, feedback, datasets, and prompts
 - Add-on support (chart v0.13+): Agent Builder (`a`), Insights (`i`), Polly (`p`) via combinable `-ld`* flags
 - Live pod-status progress during Helm installs (updates every 15s with stuck-pod detection)
 - Two-phase ALB deploy: auto-provisions ALB hostname before enabling deployment features
@@ -124,6 +126,9 @@ config:
 # Install LangSmith Deployment with specific ingress (override auto-detect)
 ./smith-fly.sh up -ld -i nginx
 
+# Install LangSmith and populate with synthetic test data
+./smith-fly.sh up -ls
+
 # Install LangSmith Deployment + Agent Builder (requires chart v0.13+)
 ./smith-fly.sh up -lda
 
@@ -146,7 +151,7 @@ config:
 ### Command Options
 
 ```
-Usage: ./smith-fly.sh <up|down|status> [-l|-ld|-ld[a][i][p]] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
+Usage: ./smith-fly.sh <up|down|status> [-l|-ls|-ld|-lds|-ld[a][i][p]] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
 
 Actions:
     up      Spin up/install LangSmith, LangSmith Deployment, or add-ons
@@ -154,6 +159,15 @@ Actions:
     status  Check installation status of LangSmith and LangSmith Deployment
 
 Options:
+    -l        Install LangSmith (tracing, eval, playground)
+    -ls       Install LangSmith + populate with synthetic test data
+    -ld       Install LangSmith Deployment (adds LangGraph deployment to -l)
+    -lds      Install LangSmith Deployment + populate with synthetic test data
+    -lda      Install LangSmith Deployment + Agent Builder (no-code agent creation, v0.13+)
+    -ldas     Install LangSmith Deployment + Agent Builder + populate with synthetic test data
+    -v        Specify version (optional)
+    -n        Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
+    -i        Ingress type: alb or nginx (auto-detected if not specified)
     -l              Install LangSmith (tracing, eval, playground)
     -ld             Install LangSmith Deployment (adds LangGraph deployment to -l)
     -ld[a][i][p]    Install LangSmith Deployment with optional add-ons (v0.13+):
@@ -164,7 +178,6 @@ Options:
     -v              Specify version (optional)
     -n              Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i              Ingress type: alb or nginx (auto-detected if not specified)
-    --debug         Enable Helm debug output (optional)
 ```
 
 > **Namespace rules**: The `-n` value must start with a lowercase letter (`a-z`), contain only lowercase alphanumeric characters or hyphens, and be at most 63 characters. Purely numeric namespaces (e.g., `15265`) are rejected because they cause Helm YAML serialization errors. Use a prefixed name instead (e.g., `ls-15265`).
@@ -335,6 +348,7 @@ smith-fly/
 │   ├── config.yaml         # Base Helm values (includes minimal resource config)
 │   └── ls_config.yaml      # Generated LangSmith config (temporary)
 └── scripts/
+    ├── populate.sh         # Synthetic data population (traces, feedback, datasets, prompts)
     └── mac/
         └── minikube.sh     # macOS Minikube starter with auto resource detection
 ```

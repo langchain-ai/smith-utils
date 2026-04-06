@@ -6,7 +6,7 @@
 # Description: Automates the installation and management of LangSmith,
 #              LangSmith Deployment, and Agent Builder on any Kubernetes cluster (cross-platform)
 # 
-# Usage: ./smith-fly.sh <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE]
+# Usage: ./smith-fly.sh <up|down|status> [-l|-ls|-ld|-lds|-lda|-ldas] [-v VERSION] [-n NAMESPACE]
 # 
 # Date: 2025-10-14
 ##############################################################################
@@ -40,6 +40,8 @@ LicenseKey=""
 apiKeySalt=""
 jwtSecret=""
 initialOrgAdminPassword=""
+POPULATE=false  # Whether to run populate.sh after install
+RESOLVED_ENDPOINT=""  # Set by display_langsmith_info for use by populate
 LANGSMITH_HOSTNAME=""  # Optional: custom hostname for LangSmith (can be set via .env)
 agentBuilderEncryptionKey=""  # Fernet key for Agent Builder (auto-generated or preserved)
 insightsEncryptionKey=""      # Fernet key for Insights (auto-generated or preserved)
@@ -365,7 +367,7 @@ set_ingress_type() {
 ##############################################################################
 show_usage() {
     cat << EOF
-Usage: $0 <up|down|status> [-l|-ld|-lda] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
+Usage: $0 <up|down|status> [-l|-ls|-ld|-lds|-lda|-ldas] [-v VERSION] [-n NAMESPACE] [-i alb|nginx] [--debug]
 
 Actions:
     up      Spin up/install LangSmith, LangSmith Deployment, or Agent Builder
@@ -374,7 +376,11 @@ Actions:
 
 Options (for 'up' action):
     -l      Install LangSmith (tracing, eval, playground)
+    -ls     Install LangSmith + populate with synthetic test data (traces, feedback, datasets, prompts)
     -ld     Install LangSmith Deployment (adds LangGraph deployment to -l)
+    -lds    Install LangSmith Deployment + populate with synthetic test data
+    -lda    Install LangSmith Deployment + Agent Builder (adds no-code agent creation to -ld, v0.13+)
+    -ldas   Install LangSmith Deployment + Agent Builder + populate with synthetic test data
     -ld[a][i][p]  Install LangSmith Deployment with optional add-ons (v0.13+ required for add-ons):
                     a = Agent Builder (no-code agent creation)
                     i = Insights
@@ -383,7 +389,7 @@ Options (for 'up' action):
     -v      Specify version (optional)
     -n      Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i      Ingress type: alb or nginx (auto-detected if not specified)
-    --debug Enable Helm debug output (optional)
+  
 
 Examples:
     $0 up -l                     # Install LangSmith (ingress auto-detected based on cluster)
@@ -392,11 +398,12 @@ Examples:
     $0 up -l -i nginx            # Install LangSmith with nginx ingress (override auto-detect)
     $0 up -l -v 0.12.3           # Install LangSmith v12+ with specific version
     $0 up -l -v 0.11.5           # Install LangSmith pre-v12 with legacy config format
-    $0 up -l --debug             # Install LangSmith with debug output
     $0 up -ld                    # Install LangSmith Deployment (automatically installs LangSmith if not present)
     $0 up -ld -i nginx           # Install LangSmith Deployment with nginx ingress
     $0 up -ld -v 0.11.0          # Install LangSmith Deployment with pre-v12 config format
-    $0 up -lda                   # Install LangSmith Deployment + Agent Builder
+    $0 up -ls                    # Install LangSmith and populate with synthetic test data
+    $0 up -ldas                  # Install everything + populate with synthetic test data
+    $0 up -lda                   # Install LangSmith Deployment + Agent Builder (requires more resources)
     $0 up -ldi                   # Install LangSmith Deployment + Insights
     $0 up -ldp                   # Install LangSmith Deployment + Polly
     $0 up -ldai                  # Install LangSmith Deployment + Agent Builder + Insights
@@ -408,7 +415,7 @@ Examples:
     $0 status -n my-namespace    # Check status in a custom namespace
 
 Notes:
-    - At least one of -l, -ld, or -lda must be specified with "up"
+    - At least one of -l, -ls, -ld, -lds, -lda, or -ldas must be specified with "up"
     - When installing LangSmith Deployment (-ld), LangSmith is automatically installed if not already present
     - Agent Builder (-lda) spawns additional operator-managed pods (its own Postgres, Redis, queue, API server)
     - On Minikube, -lda auto-patches LGP resources to dev-friendly sizes and disables autoscaling
@@ -487,6 +494,27 @@ parse_arguments() {
         case "$1" in
             -l)
                 INSTALL_LS=true
+                shift
+                ;;
+            -ls)
+                INSTALL_LS=true
+                POPULATE=true
+                shift
+                ;;
+            -ld)
+                INSTALL_LD=true
+                shift
+                ;;
+            -lds)
+                INSTALL_LD=true
+                POPULATE=true
+                shift
+                ;;
+            # Must precede -ld*: -ldas matches -ld* first and suffix "as" fails [^aip] validation.
+            -ldas)
+                INSTALL_LD=true
+                INSTALL_AB=true
+                POPULATE=true
                 shift
                 ;;
             -ld*)
@@ -782,8 +810,10 @@ json.dump(obj, sys.stdout)" \
     log INFO "Helm running (PID ${helm_pid}) — pod status updates every 15s..."
 
     # Kill helm and abort if unhealthy pods (CrashLoopBackOff/Error/OOMKilled) don't
-    # decrease for this many consecutive checks (~75s at 15s interval).
-    local stuck_threshold=5
+    # decrease for this many consecutive checks (~180s at 15s interval).
+    # Needs headroom for cold starts where images haven't been pulled yet
+    # (e.g. Postgres alone can take >3min to pull + bind PVC).
+    local stuck_threshold=12
     local stuck_count=0
     local last_bad=0
     # Consider deployment done once all pods are Running for this many consecutive checks.
@@ -1984,6 +2014,34 @@ EOF
 # Function: display_langsmith_info
 # Description: Displays LangSmith connection information
 ##############################################################################
+##############################################################################
+# Function: run_populate
+# Description: Runs scripts/populate.sh to seed LangSmith with synthetic data
+#              (traces, feedback, datasets, annotation queues, prompts)
+# Requires:    endpoint (resolved), initialOrgAdminEmail, initialOrgAdminPassword
+##############################################################################
+run_populate() {
+    local endpoint_url="$1"
+    local populate_script="${SCRIPT_DIR}/scripts/populate.sh"
+
+    if [ ! -f "$populate_script" ]; then
+        log ERROR "Populate script not found at ${populate_script}"
+        return 1
+    fi
+    if [ ! -x "$populate_script" ]; then
+        chmod +x "$populate_script"
+    fi
+
+    log INFO "Running populate script against ${endpoint_url} ..."
+    if "$populate_script" "$endpoint_url" "$initialOrgAdminEmail" "$initialOrgAdminPassword"; then
+        log SUCCESS "Populate script completed successfully"
+        return 0
+    else
+        log WARNING "Populate script exited with errors (non-fatal)"
+        return 1
+    fi
+}
+
 display_langsmith_info() {
     log INFO "Waiting for ingress to be ready..."
     sleep 10
@@ -2101,6 +2159,11 @@ EOF
     echo ""
     echo "=========================================================================="
     echo ""
+
+    # Export resolved endpoint for use by populate and other post-install steps
+    if [ "$endpoint_pending" != true ] && [ -n "$endpoint" ]; then
+        RESOLVED_ENDPOINT="http://${endpoint}"
+    fi
 }
 
 ##############################################################################
@@ -2321,6 +2384,16 @@ main() {
                 # Display connection information after any installation
                 if [ "$INSTALL_LS" = true ] || [ "$INSTALL_LD" = true ]; then
                     display_langsmith_info
+                fi
+
+                # Populate with synthetic test data if -s was specified
+                if [ "$POPULATE" = true ]; then
+                    if [ -n "$RESOLVED_ENDPOINT" ]; then
+                        run_populate "$RESOLVED_ENDPOINT" || true
+                    else
+                        log WARNING "Cannot populate: endpoint not yet resolved. Run manually:"
+                        log WARNING "  ${SCRIPT_DIR}/scripts/populate.sh <endpoint> '${initialOrgAdminEmail}' '<password>'"
+                    fi
                 fi
                 ;;
             *)
