@@ -510,7 +510,6 @@ parse_arguments() {
                 POPULATE=true
                 shift
                 ;;
-            -lda)
             -ld*)
                 local suffix="${1#-ld}"
                 # Validate suffix contains only valid feature letters: a, i, p
@@ -810,8 +809,10 @@ json.dump(obj, sys.stdout)" \
     log INFO "Helm running (PID ${helm_pid}) — pod status updates every 15s..."
 
     # Kill helm and abort if unhealthy pods (CrashLoopBackOff/Error/OOMKilled) don't
-    # decrease for this many consecutive checks (~75s at 15s interval).
-    local stuck_threshold=5
+    # decrease for this many consecutive checks (~180s at 15s interval).
+    # Needs headroom for cold starts where images haven't been pulled yet
+    # (e.g. Postgres alone can take >3min to pull + bind PVC).
+    local stuck_threshold=12
     local stuck_count=0
     local last_bad=0
     # Consider deployment done once all pods are Running for this many consecutive checks.
