@@ -569,13 +569,24 @@ parse_arguments() {
                 esac
                 shift 2
                 ;;
+            --config-dir)
+                if [ $# -lt 2 ]; then
+                    log ERROR "--config-dir option requires a directory argument"
+                    show_usage
+                fi
+                CONFIG_DIR="$2"
+                ENV_FILE="${CONFIG_DIR}/.env"
+                CONFIG_YAML="${CONFIG_DIR}/config.yaml"
+                LS_CONFIG_YAML="${CONFIG_DIR}/ls_config.yaml"
+                shift 2
+                ;;
             *)
                 log ERROR "Unknown option: $1"
                 show_usage
                 ;;
         esac
     done
-    
+
     # Validate that at least one of -l, -ld, or -lda is specified for 'up' action
     if [ "$ACTION" = "up" ]; then
         if [ "$INSTALL_LS" = false ] && [ "$INSTALL_LD" = false ]; then
