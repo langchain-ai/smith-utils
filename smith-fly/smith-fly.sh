@@ -2195,6 +2195,80 @@ EOF
 }
 
 ##############################################################################
+# Function: save_and_delete_ingresses
+# Description: Snapshots all Ingress objects in a namespace into a namespace
+#              annotation (base64-encoded JSON list) and then deletes them.
+#              Hibernated namespaces would otherwise hold onto nginx host/path
+#              claims (e.g. localhost/) and block fresh installs in sibling
+#              namespaces via the ingress admission webhook.
+# Arguments:  $1 - namespace
+##############################################################################
+save_and_delete_ingresses() {
+  local ns="$1"
+  local names
+  names=$(kubectl get ingress -n "$ns" -o name 2>/dev/null)
+  if [ -z "$names" ]; then
+    return 0
+  fi
+
+  local count
+  count=$(printf '%s\n' "$names" | grep -c .)
+
+  # Strip server-managed fields so the YAML re-applies cleanly on resume.
+  # Keep ownerReferences and helm/release annotations so ownership survives.
+  local snapshot
+  snapshot=$(kubectl get ingress -n "$ns" -o json |
+    jq -c '{apiVersion: "v1", kind: "List",
+            items: [.items[] | del(
+              .status,
+              .metadata.resourceVersion,
+              .metadata.uid,
+              .metadata.creationTimestamp,
+              .metadata.generation,
+              .metadata.managedFields,
+              .metadata.selfLink
+            )]}')
+
+  local encoded
+  encoded=$(printf '%s' "$snapshot" | base64 | tr -d '\n')
+
+  log INFO "Saving ${count} ingress(es) from ${ns} to namespace annotation"
+  kubectl annotate namespace "$ns" \
+    "smith-fly.langchain.dev/saved-ingresses=${encoded}" \
+    --overwrite >/dev/null
+
+  log INFO "Deleting ingresses in ${ns} to free host/path claims"
+  # shellcheck disable=SC2086
+  printf '%s\n' "$names" | xargs kubectl delete -n "$ns" --ignore-not-found
+}
+
+##############################################################################
+# Function: restore_saved_ingresses
+# Description: Re-applies ingresses previously saved by save_and_delete_ingresses
+#              and clears the annotation. No-op if nothing was saved.
+# Arguments:  $1 - namespace
+##############################################################################
+restore_saved_ingresses() {
+  local ns="$1"
+  local encoded
+  encoded=$(kubectl get namespace "$ns" \
+    -o jsonpath='{.metadata.annotations.smith-fly\.langchain\.dev/saved-ingresses}' \
+    2>/dev/null || echo "")
+  if [ -z "$encoded" ]; then
+    return 0
+  fi
+
+  log INFO "Restoring saved ingresses in ${ns}"
+  if printf '%s' "$encoded" | base64 -d | kubectl apply -n "$ns" -f -; then
+    kubectl annotate namespace "$ns" \
+      smith-fly.langchain.dev/saved-ingresses- \
+      2>/dev/null || true
+  else
+    log WARNING "Failed to restore ingresses in ${ns} — annotation kept for inspection"
+  fi
+}
+
+##############################################################################
 # Function: resume_from_hibernate
 # Description: Restores a hibernated namespace by scaling pods back up and
 #              removing the hibernation annotations. Inverse of `down`.
@@ -2204,6 +2278,9 @@ resume_from_hibernate() {
   local ns="$1"
 
   log INFO "Resuming hibernated namespace: ${ns}"
+
+  # Recreate ingresses first so once pods come up, traffic can already reach them
+  restore_saved_ingresses "$ns"
 
   # Scale statefulsets back up first so databases are ready before app pods start
   kubectl scale statefulset --all -n "$ns" --replicas=1
@@ -2516,6 +2593,10 @@ main() {
   if [ "$ACTION" = "down" ]; then
     # Bring down the operator first, or it'll bring pods back up
     kubectl scale deployment langsmith-operator -n $NAMESPACE --replicas=0
+    # Snapshot + delete ingresses so we don't keep host/path claims that would
+    # block fresh installs in sibling namespaces (operator is already at 0, so
+    # nothing will recreate them while we're down).
+    save_and_delete_ingresses "$NAMESPACE"
     # Scale deployments to 0
     kubectl scale deployment --all -n $NAMESPACE --replicas=0
     # Scale down statefulsets
