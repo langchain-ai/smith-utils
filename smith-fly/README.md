@@ -32,6 +32,7 @@ Key capabilities:
 - **kubectl** - Kubernetes command-line tool
 - **helm** - Kubernetes package manager (v3+)
 - **openssl** - For generating secure secrets
+- **gnu-sed** (macOS only) - GNU sed is required on macOS (`brew install gnu-sed`)
 
 Example of [Minikube script](https://github.com/langchain-ai/smith-utils/blob/main/smith-fly/scripts/mac/README.md) to quckly spin up k8s cluster.
 

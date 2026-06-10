@@ -9,7 +9,7 @@ config:
   deployment:
     enabled: false  # toggled to true dynamically by smith-fly.sh for -ld* flags
     ingressHealthCheckEnabled: false
-    # If we have tlsEnabled set to false you will need to manually edit ConfigMap langsmith-agent-builder-config
+    # If we have tlsEnabled set to false you will need to manually edit ConfigMap langsmith-fleet-config
     # VITE_AGENT_BUILDER_MCP_SERVER_URL and VITE_AGENT_BUILDER_HOST_BACKEND_URL
     # to use http instead of https and point to the correct hostname.
     tlsEnabled: false
@@ -206,12 +206,12 @@ operator:
 
 
 # =============================================================================
-# AGENT BUILDER COMPONENTS (for -lda flag, v0.13+)
-# Enables no-code agent creation directly in the LangSmith UI.
+# FLEET COMPONENTS (for -lda flag, v0.13+)
+# Enables no-code agent creation (Fleet) directly in the LangSmith UI.
 # These are enabled dynamically by smith-fly.sh alongside deployment.
 # =============================================================================
 
-agentBuilderToolServer:
+fleetToolServer:
   deployment:
     replicas: 1
     resources:
@@ -222,7 +222,7 @@ agentBuilderToolServer:
         cpu: 1000m
         memory: 1Gi
 
-agentBuilderTriggerServer:
+fleetTriggerServer:
   deployment:
     replicas: 1
     resources:
@@ -232,3 +232,16 @@ agentBuilderTriggerServer:
       limits:
         cpu: 500m
         memory: 512Mi
+
+# =============================================================================
+# ADD-ON COMPONENTS (disabled by default, enabled dynamically by smith-fly.sh)
+# =============================================================================
+
+insights:
+  enabled: false
+
+polly:
+  enabled: false
+
+fleet:
+  enabled: false
