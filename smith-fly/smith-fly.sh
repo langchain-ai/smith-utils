@@ -169,6 +169,37 @@ is_version_v13_plus() {
 }
 
 ##############################################################################
+# Function: is_version_v15_plus
+# Description: Checks if specified version is >= 0.15.0
+# Returns: 0 if version >= 0.15.0 or empty (latest), 1 otherwise
+#
+# v0.15 renamed Agent Builder -> Fleet and replaced the agent-bootstrap job
+# with standalone, Helm-managed Fleet/Insights/Polly services. Used to switch
+# between the legacy (config.agentBuilder + backend.agentBootstrap) path and
+# the new top-level fleet/insights/polly blocks.
+##############################################################################
+is_version_v15_plus() {
+    local version="$1"
+    local major minor
+
+    if [ -z "$version" ]; then
+        return 0
+    fi
+
+    IFS='.' read -r major minor _ <<< "$version"
+
+    if ! [[ "$major" =~ ^[0-9]+$ ]] || ! [[ "$minor" =~ ^[0-9]+$ ]]; then
+        return 0
+    fi
+
+    if [ "$major" -gt 0 ] || [ "$minor" -ge 15 ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+##############################################################################
 # Function: is_version_in_range
 # Description: Checks if version is within a specific minor version range (inclusive)
 # Args: version, min_minor, max_minor (assumes major=0)
@@ -417,14 +448,18 @@ Examples:
 Notes:
     - At least one of -l, -ls, -ld, -lds, -lda, or -ldas must be specified with "up"
     - When installing LangSmith Deployment (-ld), LangSmith is automatically installed if not already present
-    - Agent Builder (-lda) spawns additional operator-managed pods (its own Postgres, Redis, queue, API server)
-    - On Minikube, -lda auto-patches LGP resources to dev-friendly sizes and disables autoscaling
+    - Agent Builder (-lda) spawns additional pods (its own Postgres, Redis, queue, API server)
     - Recommended Minikube resources for -lda: 10 CPUs / 24Gi RAM (Docker Desktop)
     - The "down" action removes LangSmith from all namespaces (or a specific one with -n)
     - Configuration is read from ${ENV_FILE}
     - Namespace is auto-generated from hostname unless overridden with -n
     - Version >= 0.12.0 uses new config format (config.deployment, config.hostname)
     - Version < 0.12.0 uses legacy config format (config.langgraphPlatform, langgraphPlatformLicenseKey)
+    - Chart 0.13.x-0.14.x: Agent Builder runs via the agent-bootstrap job
+      (on Minikube, LGP resources are auto-patched to dev sizes + autoscaling off)
+    - Chart >= 0.15.0: Agent Builder was renamed to "Fleet"; Fleet/Insights/Polly
+      deploy as standalone Helm services (no agent-bootstrap job) and are
+      installed directly by the single helm upgrade
     - Ingress type is auto-detected: AWS EKS -> ALB, other clusters -> nginx
     - Use -i flag to override auto-detection (e.g., -i alb or -i nginx)
 
@@ -861,7 +896,7 @@ json.dump(obj, sys.stdout)" \
                 CrashLoopBackOff|Error|\
                 OOMKilled|ImagePullBackOff|\
                 ErrImagePull)
-                    if [[ "$pname" =~ ^(smith-|lg-|clio-|agent-builder-) ]]; then
+                    if [[ "$pname" =~ ^(smith-|lg-|clio-|agent-builder-|fleet-|standalone-) ]]; then
                         (( other++ )) || true
                     else
                         (( bad++ )) || true
@@ -1011,10 +1046,15 @@ load_existing_secrets() {
     existing_jwt=$(grep --color=never -E '^\s*jwtSecret:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*jwtSecret:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
     existing_password=$(grep --color=never -E '^\s*initialOrgAdminPassword:' "$LS_CONFIG_YAML" 2>/dev/null | $SED_CMD 's/.*initialOrgAdminPassword:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
 
-    # Also try to preserve Agent Builder and Insights encryption keys if they exist
-    # encryptionKey appears under both agentBuilder and insights sections; grab both
+    # Also try to preserve Agent Builder / Fleet and Insights encryption keys if they exist.
+    # encryptionKey appears under the agentBuilder (<0.15), fleet (>=0.15), insights, and
+    # polly sections; grab them all. For the Fleet key, prefer the legacy 'agentBuilder:'
+    # value and fall back to the v0.15 top-level 'fleet:' block.
     local existing_ab_key existing_insights_key existing_polly_key
     existing_ab_key=$(grep --color=never -A5 'agentBuilder:' "$LS_CONFIG_YAML" 2>/dev/null | grep --color=never 'encryptionKey:' | $SED_CMD 's/.*encryptionKey:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
+    if [ -z "$existing_ab_key" ]; then
+        existing_ab_key=$(grep --color=never -A5 '^fleet:' "$LS_CONFIG_YAML" 2>/dev/null | grep --color=never 'encryptionKey:' | $SED_CMD 's/.*encryptionKey:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
+    fi
     existing_insights_key=$(grep --color=never -A5 'insights:' "$LS_CONFIG_YAML" 2>/dev/null | grep --color=never 'encryptionKey:' | $SED_CMD 's/.*encryptionKey:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
     existing_polly_key=$(grep --color=never -A5 'polly:' "$LS_CONFIG_YAML" 2>/dev/null | grep --color=never 'encryptionKey:' | $SED_CMD 's/.*encryptionKey:\s*"\?\([^"]*\)"\?.*/\1/' | head -1)
 
@@ -1154,7 +1194,29 @@ create_langsmith_config() {
     
     # Remove backup file
     rm -f "${LS_CONFIG_YAML}.bak"
-    
+
+    # v0.15+ renamed the Agent Builder tool/trigger server value keys to
+    # fleetToolServer / fleetTriggerServer. The chart's validate.yaml HARD-FAILS
+    # (via hasKey) if the deprecated top-level agentBuilderToolServer /
+    # agentBuilderTriggerServer blocks are present AT ALL — even on a plain -l
+    # install with no Fleet. Strip them from the generated values so every v0.15+
+    # install renders. Pre-0.15 charts still consume these blocks, so they are
+    # left untouched there.
+    if is_version_v15_plus "$VERSION"; then
+        local stripped
+        stripped=$(mktemp)
+        # Drop any top-level block named agentBuilderToolServer/agentBuilderTriggerServer:
+        # set 'drop' on its header line and keep skipping until the next top-level key.
+        awk '
+            /^[A-Za-z0-9_-]+:/ {
+                key=$0; sub(/:.*/,"",key)
+                drop=(key=="agentBuilderToolServer" || key=="agentBuilderTriggerServer") ? 1 : 0
+            }
+            !drop { print }
+        ' "$LS_CONFIG_YAML" > "$stripped" && mv "$stripped" "$LS_CONFIG_YAML"
+        log INFO "Stripped deprecated agentBuilderToolServer/agentBuilderTriggerServer keys (v0.15+ uses fleet*)"
+    fi
+
     log SUCCESS "LangSmith configuration file created: ${LS_CONFIG_YAML}"
 }
 
@@ -1717,8 +1779,10 @@ install_langsmith_deployment() {
         # Priority 3: Fallback when no hostname is available
         local alb_patch_host=false
         if [ -z "$ingress_hostname" ] || [ "$ingress_hostname" = "<pending-ingress-hostname>" ]; then
-            if [ "$INSTALL_AB" = true ] && is_minikube_cluster; then
-                # Minikube: use internal ingress DNS so the listener can health-check LGP pods
+            if [ "$INSTALL_AB" = true ] && is_minikube_cluster && ! is_version_v15_plus "$VERSION"; then
+                # Legacy (<0.15) Minikube: use internal ingress DNS so the deployment
+                # listener can health-check LGP pods through the ingress. v0.15 Fleet
+                # is standalone and doesn't need this, so it falls through to localhost.
                 ingress_hostname="ingress-nginx-controller.ingress-nginx.svc.cluster.local"
                 log INFO "Using internal ingress hostname for Agent Builder on Minikube: ${ingress_hostname}"
             elif [ "$INGRESS_TYPE" = "alb" ]; then
@@ -1754,7 +1818,11 @@ install_langsmith_deployment() {
         # Enable deployment in the config (deployment block already exists in config.yaml
         # with enabled: false — flip it to true to avoid duplicate YAML keys).
         local features_enabled=()
-        [ "$INSTALL_AB" = true ]       && features_enabled+=("agentBuilder")
+        if is_version_v15_plus "$VERSION"; then
+            [ "$INSTALL_AB" = true ]   && features_enabled+=("fleet")
+        else
+            [ "$INSTALL_AB" = true ]   && features_enabled+=("agentBuilder")
+        fi
         [ "$INSTALL_INSIGHTS" = true ] && features_enabled+=("insights")
         [ "$INSTALL_POLLY" = true ]    && features_enabled+=("polly")
         log INFO "Enabling config.deployment, setting config.hostname${features_enabled:+, $(IFS=', '; echo "${features_enabled[*]}")} in LangSmith config"
@@ -1763,30 +1831,65 @@ install_langsmith_deployment() {
         $SED_CMD -i.bak '/^  deployment:$/{n; s/enabled: false/enabled: true/}' "$LS_CONFIG_YAML"
         rm -f "${LS_CONFIG_YAML}.bak"
 
-        # Inject hostname and optional feature configs after 'config:' line
+        # Inject hostname (always) and, for pre-v0.15 charts, the legacy under-config:
+        # feature blocks. The hostname is a child of 'config:' in all versions.
+        #
+        # Agent Builder / Insights / Polly config differs by chart version:
+        #   <0.15: bundled-agent path -> config.agentBuilder / config.insights /
+        #          config.polly blocks (children of 'config:'), bootstrapped by the
+        #          backend.agentBootstrap Helm hook.
+        #   >=0.15: standalone services -> top-level fleet: / insights: / polly:
+        #          blocks (siblings of 'config:'), deployed directly by the chart.
+        #          See is_version_v15_plus and the KB "Upgrading to v0.15" guide.
         local temp_insert
         temp_insert=$(mktemp)
         {
             echo "  hostname: \"${ingress_hostname}\""
-            if [ "$INSTALL_AB" = true ]; then
-                echo "  agentBuilder:"
-                echo "    enabled: true"
-                echo "    encryptionKey: \"${agentBuilderEncryptionKey}\""
-            fi
-            if [ "$INSTALL_INSIGHTS" = true ]; then
-                echo "  insights:"
-                echo "    enabled: true"
-                echo "    encryptionKey: \"${insightsEncryptionKey}\""
-            fi
-            if [ "$INSTALL_POLLY" = true ]; then
-                echo "  polly:"
-                echo "    enabled: true"
-                echo "    encryptionKey: \"${pollyEncryptionKey}\""
+            if ! is_version_v15_plus "$VERSION"; then
+                # Legacy (<0.15) under-config: feature blocks.
+                if [ "$INSTALL_AB" = true ]; then
+                    echo "  agentBuilder:"
+                    echo "    enabled: true"
+                    echo "    encryptionKey: \"${agentBuilderEncryptionKey}\""
+                fi
+                if [ "$INSTALL_INSIGHTS" = true ]; then
+                    echo "  insights:"
+                    echo "    enabled: true"
+                    echo "    encryptionKey: \"${insightsEncryptionKey}\""
+                fi
+                if [ "$INSTALL_POLLY" = true ]; then
+                    echo "  polly:"
+                    echo "    enabled: true"
+                    echo "    encryptionKey: \"${pollyEncryptionKey}\""
+                fi
             fi
         } > "$temp_insert"
         $SED_CMD -i.bak "/^config:/r $temp_insert" "$LS_CONFIG_YAML"
         rm -f "$temp_insert" "${LS_CONFIG_YAML}.bak"
-        
+
+        # For v0.15+, append the standalone top-level fleet/insights/polly blocks.
+        # These are siblings of 'config:', each with their own Helm-managed
+        # Deployments plus bundled PostgreSQL + Redis (no agent-bootstrap job).
+        if is_version_v15_plus "$VERSION"; then
+            {
+                if [ "$INSTALL_AB" = true ]; then
+                    echo "fleet:"
+                    echo "  enabled: true"
+                    echo "  encryptionKey: \"${agentBuilderEncryptionKey}\""
+                fi
+                if [ "$INSTALL_INSIGHTS" = true ]; then
+                    echo "insights:"
+                    echo "  enabled: true"
+                    echo "  encryptionKey: \"${insightsEncryptionKey}\""
+                fi
+                if [ "$INSTALL_POLLY" = true ]; then
+                    echo "polly:"
+                    echo "  enabled: true"
+                    echo "  encryptionKey: \"${pollyEncryptionKey}\""
+                fi
+            } >> "$LS_CONFIG_YAML"
+        fi
+
         # Scope operator to this namespace in the values file to ensure the chart
         # renders namespaced Role/RoleBinding instead of cluster-scoped ClusterRole.
         # Prevents "invalid ownership metadata" errors on shared clusters.
@@ -1829,8 +1932,43 @@ install_langsmith_deployment() {
             helm_cmd+=" --set frontend.service.type=ClusterIP"
         fi
 
-        # Enable Agent Builder and Insights components if requested (v0.13+)
-        if [ "$INSTALL_AB" = true ]; then
+        # Enable Agent Builder / Fleet, Insights, and Polly components (v0.13+).
+        if is_version_v15_plus "$VERSION"; then
+            # v0.15+: Fleet, Insights, and Polly are standalone, Helm-managed
+            # services. CRITICAL: insights.enabled and polly.enabled DEFAULT TO
+            # TRUE in the chart, and each enabled service requires an
+            # encryptionKey (chart validate.yaml fails otherwise). So we set
+            # EVERY service's enabled flag explicitly — true when requested
+            # (encryptionKey is written into the values file), false otherwise —
+            # which also avoids deploying unwanted Postgres/Redis pods. There is
+            # no agent-bootstrap job, so the single --wait upgrade installs them.
+            if [ "$INSTALL_AB" = true ]; then
+                helm_cmd+=" --set fleet.enabled=true"
+                helm_cmd+=" --set fleetToolServer.enabled=true"
+                helm_cmd+=" --set fleetTriggerServer.enabled=true"
+            else
+                helm_cmd+=" --set fleet.enabled=false"
+                helm_cmd+=" --set fleetToolServer.enabled=false"
+                helm_cmd+=" --set fleetTriggerServer.enabled=false"
+            fi
+            if [ "$INSTALL_INSIGHTS" = true ]; then
+                helm_cmd+=" --set insights.enabled=true"
+            else
+                helm_cmd+=" --set insights.enabled=false"
+            fi
+            if [ "$INSTALL_POLLY" = true ]; then
+                helm_cmd+=" --set polly.enabled=true"
+            else
+                helm_cmd+=" --set polly.enabled=false"
+            fi
+            if is_minikube_cluster && { [ "$INSTALL_AB" = true ] || [ "$INSTALL_INSIGHTS" = true ] || [ "$INSTALL_POLLY" = true ]; }; then
+                # tls / ingress health-check tweaks remain relevant for the
+                # LangGraph deployment listener on self-signed Minikube ingress.
+                helm_cmd+=" --set config.tlsEnabled=false"
+                helm_cmd+=" --set config.deployment.ingressHealthCheckEnabled=false"
+            fi
+        elif [ "$INSTALL_AB" = true ]; then
+            # Legacy (<0.15) Agent Builder bootstrap path.
             helm_cmd+=" --set agentBuilderToolServer.enabled=true"
             helm_cmd+=" --set agentBuilderTriggerServer.enabled=true"
             if [ "$INSTALL_INSIGHTS" = true ]; then
@@ -1883,7 +2021,22 @@ install_langsmith_deployment() {
             fi
         fi
 
-        if [ "$INSTALL_AB" = true ]; then
+        if is_version_v15_plus "$VERSION"; then
+            # v0.15+: Fleet/Insights/Polly are standalone Helm-managed services
+            # installed by the single --wait upgrade above. No agent-bootstrap
+            # job, operator scale-down, LGP resource patching, or localhost URL
+            # rewriting is needed (those were all artifacts of the deprecated
+            # bootstrap path).
+            if [ "$INSTALL_AB" = true ] || [ "$INSTALL_INSIGHTS" = true ] || [ "$INSTALL_POLLY" = true ]; then
+                local enabled_svcs=()
+                [ "$INSTALL_AB" = true ]       && enabled_svcs+=("Fleet")
+                [ "$INSTALL_INSIGHTS" = true ] && enabled_svcs+=("Insights")
+                [ "$INSTALL_POLLY" = true ]    && enabled_svcs+=("Polly")
+                log SUCCESS "LangSmith upgraded with deployment and standalone $(IFS='/'; echo "${enabled_svcs[*]}") enabled"
+            else
+                log SUCCESS "LangSmith upgraded with deployment feature enabled"
+            fi
+        elif [ "$INSTALL_AB" = true ]; then
             if is_minikube_cluster; then
                 log SUCCESS "Phase 1 complete: core components installed"
 
