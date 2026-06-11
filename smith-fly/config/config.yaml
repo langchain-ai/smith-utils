@@ -206,9 +206,16 @@ operator:
 
 
 # =============================================================================
-# AGENT BUILDER COMPONENTS (for -lda flag, v0.13+)
+# AGENT BUILDER COMPONENTS (for -lda flag, chart 0.13.x - 0.14.x ONLY)
 # Enables no-code agent creation directly in the LangSmith UI.
 # These are enabled dynamically by smith-fly.sh alongside deployment.
+#
+# NOTE: In chart v0.15+, Agent Builder was renamed to "Fleet" and these keys
+# were renamed to fleetToolServer / fleetTriggerServer (deployed as standalone
+# Helm services, no agent-bootstrap job). The chart has no values schema, so
+# these legacy keys are harmless/ignored on v0.15+; smith-fly.sh injects the
+# top-level fleet:/insights:/polly: blocks at runtime for v0.15+ instead.
+# See is_version_v15_plus in smith-fly.sh.
 # =============================================================================
 
 agentBuilderToolServer:
