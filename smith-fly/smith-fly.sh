@@ -1243,12 +1243,16 @@ install_langsmith() {
     helm_cmd+=" --wait --timeout 30m"
     helm_cmd+=" --hide-notes"
     
-    # Add version if specified
+    # Add version if specified. With no version, Helm pulls the latest chart,
+    # which (>=0.15) uses the Fleet layout — so the default install behavior
+    # tracks whatever the newest release happens to be. Surface that explicitly.
     if [ -n "$VERSION" ]; then
         helm_cmd+=" --version ${VERSION}"
         log INFO "Installing LangSmith version: ${VERSION}"
+    else
+        log INFO "No chart version specified; installing the latest available (>=0.15 uses the Fleet layout)"
     fi
-    
+
     # Set frontend service type to ClusterIP when using Ingress resources
     # Both ALB and nginx ingress controllers use Ingress resources, not LoadBalancer services
     # The ingress controller handles external traffic routing, not the service directly
@@ -1274,7 +1278,22 @@ install_langsmith() {
         log INFO "KEDA not installed, disabling KEDA integration for operator"
         helm_cmd+=" --set operator.kedaEnabled=false"
     fi
-    
+
+    # v0.15+: the chart DEFAULTS insights.enabled and polly.enabled to TRUE, and
+    # every enabled service requires an encryptionKey or validate.yaml hard-fails.
+    # This is the LangSmith-only path (-l), so Fleet/Insights/Polly are never
+    # requested here — explicitly switch them all off so a plain install renders
+    # (and we don't spin up unwanted Postgres/Redis pods). Mirrors the same guard
+    # in install_langsmith_deployment. Pre-0.15 charts default these off, so skip.
+    if is_version_v15_plus "$VERSION"; then
+        helm_cmd+=" --set fleet.enabled=false"
+        helm_cmd+=" --set fleetToolServer.enabled=false"
+        helm_cmd+=" --set fleetTriggerServer.enabled=false"
+        helm_cmd+=" --set insights.enabled=false"
+        helm_cmd+=" --set polly.enabled=false"
+        log INFO "Disabling Fleet/Insights/Polly for LangSmith-only install (v0.15+ defaults them on)"
+    fi
+
     # Add debug flag if enabled
     if [ "$DEBUG" = true ]; then
         helm_cmd+=" --debug"
@@ -1905,12 +1924,16 @@ install_langsmith_deployment() {
         helm_cmd+=" --wait --timeout 30m"
         helm_cmd+=" --hide-notes"
         
-        # Add version if specified (important: preserve version when upgrading for deployment)
+        # Add version if specified (important: preserve version when upgrading for deployment).
+        # With no version, Helm pulls the latest chart, which (>=0.15) uses the Fleet
+        # layout — so the default install behavior tracks the newest release.
         if [ -n "$VERSION" ]; then
             helm_cmd+=" --version ${VERSION}"
             log INFO "Using LangSmith version: ${VERSION}"
+        else
+            log INFO "No chart version specified; using the latest available (>=0.15 uses the Fleet layout)"
         fi
-        
+
         # Only skip CRD creation if CRD already exists (shared cluster scenario)
         # This prevents "invalid ownership metadata" errors in shared clusters
         if kubectl get crd lgps.apps.langchain.ai &> /dev/null; then
