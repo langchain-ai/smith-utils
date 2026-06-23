@@ -211,7 +211,7 @@ operator:
 # These are enabled dynamically by smith-fly.sh alongside deployment.
 # =============================================================================
 
-agentBuilderToolServer:
+fleetToolServer:
   deployment:
     replicas: 1
     resources:
@@ -222,7 +222,7 @@ agentBuilderToolServer:
         cpu: 1000m
         memory: 1Gi
 
-agentBuilderTriggerServer:
+fleetTriggerServer:
   deployment:
     replicas: 1
     resources:
