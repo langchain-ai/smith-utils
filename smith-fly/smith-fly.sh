@@ -169,6 +169,35 @@ is_version_v13_plus() {
 }
 
 ##############################################################################
+# Function: is_version_v15_plus
+# Description: Checks if specified version is >= 0.15.0 (the Fleet rename boundary).
+#   Chart 0.15.0 renamed agentBuilderToolServer/agentBuilderTriggerServer ->
+#   fleetToolServer/fleetTriggerServer and now hard-fails (validate.yaml) if the
+#   legacy keys are present. Charts < 0.15.0 still expect the legacy keys.
+# Returns: 0 if version >= 0.15.0 or empty (latest), 1 otherwise
+##############################################################################
+is_version_v15_plus() {
+    local version="$1"
+    local major minor
+
+    if [ -z "$version" ]; then
+        return 0
+    fi
+
+    IFS='.' read -r major minor _ <<< "$version"
+
+    if ! [[ "$major" =~ ^[0-9]+$ ]] || ! [[ "$minor" =~ ^[0-9]+$ ]]; then
+        return 0
+    fi
+
+    if [ "$major" -gt 0 ] || [ "$minor" -ge 15 ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+##############################################################################
 # Function: is_version_in_range
 # Description: Checks if version is within a specific minor version range (inclusive)
 # Args: version, min_minor, max_minor (assumes major=0)
@@ -1077,7 +1106,20 @@ create_langsmith_config() {
     
     # Copy base config to LangSmith config
     cp "$CONFIG_YAML" "$LS_CONFIG_YAML"
-    
+
+    # Fleet rename compatibility (chart 0.15.0): config.yaml uses the canonical
+    # fleetToolServer/fleetTriggerServer keys. Charts >= 0.15.0 require them and
+    # reject the legacy agentBuilder* names; charts < 0.15.0 only understand the
+    # legacy names. Downgrade the generated values for older charts so a single
+    # config.yaml works across versions.
+    if ! is_version_v15_plus "$VERSION"; then
+        log INFO "Chart < 0.15.0 detected: using legacy agentBuilder* fleet-server keys"
+        $SED_CMD -i \
+            -e 's/fleetToolServer/agentBuilderToolServer/g' \
+            -e 's/fleetTriggerServer/agentBuilderTriggerServer/g' \
+            "$LS_CONFIG_YAML"
+    fi
+
     # Generate secrets only if not already loaded from existing config
     if [ -z "$apiKeySalt" ] || [ -z "$jwtSecret" ] || [ -z "$initialOrgAdminPassword" ]; then
         generate_secrets
@@ -1831,8 +1873,15 @@ install_langsmith_deployment() {
 
         # Enable Agent Builder and Insights components if requested (v0.13+)
         if [ "$INSTALL_AB" = true ]; then
-            helm_cmd+=" --set agentBuilderToolServer.enabled=true"
-            helm_cmd+=" --set agentBuilderTriggerServer.enabled=true"
+            # Fleet rename (chart 0.15.0): use fleet* keys on new charts, legacy
+            # agentBuilder* on older ones.
+            if is_version_v15_plus "$VERSION"; then
+                helm_cmd+=" --set fleetToolServer.enabled=true"
+                helm_cmd+=" --set fleetTriggerServer.enabled=true"
+            else
+                helm_cmd+=" --set agentBuilderToolServer.enabled=true"
+                helm_cmd+=" --set agentBuilderTriggerServer.enabled=true"
+            fi
             if [ "$INSTALL_INSIGHTS" = true ]; then
                 helm_cmd+=" --set config.insights.enabled=true"
             fi
@@ -1915,8 +1964,14 @@ install_langsmith_deployment() {
                 helm_cmd2+=" --timeout 30m"
                 helm_cmd2+=" --hide-notes"
                 helm_cmd2+=" --set backend.agentBootstrap.enabled=true"
-                helm_cmd2+=" --set agentBuilderToolServer.enabled=true"
-                helm_cmd2+=" --set agentBuilderTriggerServer.enabled=true"
+                # Fleet rename (chart 0.15.0): fleet* on new charts, legacy on older.
+                if is_version_v15_plus "$VERSION"; then
+                    helm_cmd2+=" --set fleetToolServer.enabled=true"
+                    helm_cmd2+=" --set fleetTriggerServer.enabled=true"
+                else
+                    helm_cmd2+=" --set agentBuilderToolServer.enabled=true"
+                    helm_cmd2+=" --set agentBuilderTriggerServer.enabled=true"
+                fi
                 if [ "$INSTALL_INSIGHTS" = true ]; then
                     helm_cmd2+=" --set config.insights.enabled=true"
                 fi
