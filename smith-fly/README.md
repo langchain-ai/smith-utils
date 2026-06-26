@@ -1,12 +1,12 @@
-# smith-fly - LangSmith, LangSmith Deployment & Agent Builder Installer
+# smith-fly - LangSmith, LangSmith Deployment & Fleet Installer
 
-Automated installation and management tool for LangSmith, LangSmith Deployment, and Agent Builder on any Kubernetes cluster.
+Automated installation and management tool for LangSmith, LangSmith Deployment, and Fleet on any Kubernetes cluster.
 
 > ⚠️ **IMPORTANT**: This script is intended for **TEST PURPOSES ONLY**. It is designed for quick testing, development, and reproduction environments. Do not use this for production deployments.
 
 ## Purpose
 
-This script automates the deployment of LangSmith, LangSmith Deployment, and Agent Builder to Kubernetes clusters for **testing and development purposes**. It provides a quick way to spin up environments for reproduction, debugging, and evaluation across multiple cloud providers and on-premise environments.
+This script automates the deployment of LangSmith, LangSmith Deployment, and Fleet to Kubernetes clusters for **testing and development purposes**. It provides a quick way to spin up environments for reproduction, debugging, and evaluation across multiple cloud providers and on-premise environments.
 
 Key capabilities:
 
@@ -19,9 +19,9 @@ Key capabilities:
 - Clean uninstallation for resource cleanup (single namespace or all at once)
 - LangSmith Deployments UI enabled by default (shows in LangSmith menu)
 - Shared cluster support (multiple installations without CRD conflicts)
-- Agent Builder support (`-lda` flag, chart v0.13+) with two-phase Minikube install
+- Fleet support (`-lda` flag, chart v0.15+) deployed as standard Helm-managed Deployments
 - Post-install synthetic data population (append `s` to any flag, e.g. `-ls`, `-lds`, `-ldas`) with traces, feedback, datasets, and prompts
-- Add-on support (chart v0.13+): Agent Builder (`a`), Insights (`i`), Polly (`p`) via combinable `-ld`* flags
+- Add-on support (chart v0.15+): Fleet (`a`), Insights (`i`), Polly (`p`) via combinable `-ld`* flags
 - Live pod-status progress during Helm installs (updates every 15s with stuck-pod detection)
 - Two-phase ALB deploy: auto-provisions ALB hostname before enabling deployment features
 
@@ -76,22 +76,25 @@ config:
   initialOrgAdminPassword: "" # Will be populated by script
 ```
 
-For LangSmith Deployment, the script dynamically enables `config.deployment` and injects `config.hostname`. Add-ons (Agent Builder, Insights, Polly) each get their own block with an auto-generated Fernet encryption key:
+For LangSmith Deployment, the script dynamically enables `config.deployment` and injects `config.hostname`. Add-ons (Fleet, Insights, Polly) are emitted as **top-level** blocks (the chart v0.15+ model — standalone Deployments, not the deprecated `config.agentBuilder` bootstrap path), each with an auto-generated Fernet encryption key:
 
 ```yaml
 config:
   deployment:
     enabled: true
   hostname: "auto-detected-or-custom"
-  agentBuilder:              # -lda
-    enabled: true
-    encryptionKey: "..."
-  insights:                  # -ldi
-    enabled: true
-    encryptionKey: "..."
-  polly:                     # -ldp
-    enabled: true
-    encryptionKey: "..."
+fleet:                       # -lda
+  enabled: true
+  namePrefix: "fleet"
+  encryptionKey: "..."
+insights:                    # -ldi
+  enabled: true
+  namePrefix: "insights"
+  encryptionKey: "..."
+polly:                       # -ldp
+  enabled: true
+  namePrefix: "polly"
+  encryptionKey: "..."
 ```
 
 ## Usage
@@ -130,7 +133,7 @@ config:
 # Install LangSmith and populate with synthetic test data
 ./smith-fly.sh up -ls
 
-# Install LangSmith Deployment + Agent Builder (requires chart v0.13+)
+# Install LangSmith Deployment + Fleet (requires chart v0.15+)
 ./smith-fly.sh up -lda
 
 # Install LangSmith Deployment + Insights
@@ -139,7 +142,7 @@ config:
 # Install LangSmith Deployment + Polly
 ./smith-fly.sh up -ldp
 
-# Install LangSmith Deployment + Agent Builder + Insights + Polly (all add-ons)
+# Install LangSmith Deployment + Fleet + Insights + Polly (all add-ons)
 ./smith-fly.sh up -ldaip
 
 # Uninstall LangSmith from ALL namespaces (auto-discovers deployments)
@@ -164,15 +167,15 @@ Options:
     -ls       Install LangSmith + populate with synthetic test data
     -ld       Install LangSmith Deployment (adds LangGraph deployment to -l)
     -lds      Install LangSmith Deployment + populate with synthetic test data
-    -lda      Install LangSmith Deployment + Agent Builder (no-code agent creation, v0.13+)
-    -ldas     Install LangSmith Deployment + Agent Builder + populate with synthetic test data
+    -lda      Install LangSmith Deployment + Fleet (no-code agent creation, v0.15+)
+    -ldas     Install LangSmith Deployment + Fleet + populate with synthetic test data
     -v        Specify version (optional)
     -n        Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i        Ingress type: alb or nginx (auto-detected if not specified)
     -l              Install LangSmith (tracing, eval, playground)
     -ld             Install LangSmith Deployment (adds LangGraph deployment to -l)
-    -ld[a][i][p]    Install LangSmith Deployment with optional add-ons (v0.13+):
-                      a = Agent Builder (no-code agent creation)
+    -ld[a][i][p]    Install LangSmith Deployment with optional add-ons (v0.15+):
+                      a = Fleet (no-code agent creation)
                       i = Insights
                       p = Polly
                     Letters combine freely: -lda -ldi -ldp -ldai -ldip -ldaip
@@ -324,7 +327,7 @@ The script automatically detects ingress endpoints using both hostname (AWS) and
 
 - Admin passwords are automatically generated with required symbols
 - Secrets are generated using OpenSSL with 32-byte entropy
-- Fernet encryption keys for Agent Builder, Insights, and Polly are auto-generated and preserved across upgrades
+- Fernet encryption keys for Fleet, Insights, and Polly are auto-generated and preserved across upgrades
 - Credentials are displayed once after installation - save them securely
 - Configuration files containing secrets are created locally - handle with care
 - When deploying LangSmith Deployment on top of an existing LangSmith installation (`up -ld` after `up -l`), secrets are automatically preserved from the existing configuration to ensure consistency
@@ -373,15 +376,14 @@ smith-fly/
 - ALB hostname fix (auto-patch ingress when no custom hostname is set)
 - Minikube support with auto port-forward and KEDA detection
 - Minimal resource configuration for local development
-- Agent Builder support (`-lda` flag) with two-phase Minikube install
-- Insights add-on support (`-ldi` flag, v0.13+)
-- Polly add-on support (`-ldp` flag, v0.13+)
+- Fleet support (`-lda` flag) as standalone Helm-managed Deployments (chart v0.15+)
+- Insights add-on support (`-ldi` flag, v0.15+)
+- Polly add-on support (`-ldp` flag, v0.15+)
 - Combinable add-on flags (`-ldaip` for all add-ons at once)
 - Live pod-status progress during Helm installs (stuck-pod detection)
 - Two-phase ALB deploy (auto-provisions ALB before enabling deployment)
 - ALB ingress preservation via managedFields patch (no ALB re-creation on upgrades)
 - Deployment block in `config.yaml` with disabled defaults
-- Known-bad version range detection (0.13.17–0.13.22 bootstrap regression)
 - Improved teardown (LGP CRD cleanup, all PVCs, released PV cleanup)
 - Support external database configuration
 - Add metrics collection integration
