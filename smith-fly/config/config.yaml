@@ -16,6 +16,10 @@ config:
   langsmithLicenseKey: ""
   apiKeySalt: ""
   authType: "mixed"
+  # basicAuth is the default. With `--auth keycloak`, smith-fly.sh removes this
+  # entire basicAuth block at runtime and injects an `oauth:` block instead (OAuth
+  # and basic auth cannot coexist). It also flips config.deployment.tlsEnabled to
+  # true and provisions a self-signed TLS secret. See docs/keycloak-oauth-scim.md.
   basicAuth:
     enabled: true
     initialOrgAdminEmail: ""

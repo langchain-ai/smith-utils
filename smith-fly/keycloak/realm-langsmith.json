@@ -1,0 +1,84 @@
+{
+  "realm": "langsmith",
+  "enabled": true,
+  "displayName": "LangSmith (local)",
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "clients": [
+    {
+      "clientId": "langsmith",
+      "name": "LangSmith Self-Hosted",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "__CLIENT_SECRET__",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "https://__LANGSMITH_HOST__/api/v1/oauth/custom-oidc/callback"
+      ],
+      "webOrigins": [
+        "https://__LANGSMITH_HOST__"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "https://__LANGSMITH_HOST__"
+      }
+    }
+  ],
+  "groups": [
+    {
+      "name": "LS:Organization Admins",
+      "path": "/LS:Organization Admins"
+    },
+    {
+      "name": "LS:Organization User:Production:Editor",
+      "path": "/LS:Organization User:Production:Editor"
+    },
+    {
+      "name": "LS:Organization User:Engineering:Admin",
+      "path": "/LS:Organization User:Engineering:Admin"
+    }
+  ],
+  "users": [
+    {
+      "username": "ls-admin",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "ls-admin@example.com",
+      "firstName": "LangSmith",
+      "lastName": "Admin",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Passw0rd!",
+          "temporary": false
+        }
+      ],
+      "groups": [
+        "/LS:Organization Admins"
+      ]
+    },
+    {
+      "username": "ls-editor",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "ls-editor@example.com",
+      "firstName": "Production",
+      "lastName": "Editor",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Passw0rd!",
+          "temporary": false
+        }
+      ],
+      "groups": [
+        "/LS:Organization User:Production:Editor"
+      ]
+    }
+  ]
+}

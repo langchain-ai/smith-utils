@@ -31,8 +31,9 @@ Key capabilities:
 
 - **kubectl** - Kubernetes command-line tool
 - **helm** - Kubernetes package manager (v3+)
-- **openssl** - For generating secure secrets
+- **openssl** - For generating secure secrets (and self-signed TLS certs for OAuth)
 - **gnu-sed** (macOS only) - GNU sed is required on macOS (`brew install gnu-sed`)
+- **docker** (only for `--auth keycloak`) - runs the local Keycloak IdP via `scripts/keycloak.sh`
 
 Example of [Minikube script](https://github.com/langchain-ai/smith-utils/blob/main/smith-fly/scripts/mac/README.md) to quckly spin up k8s cluster.
 
@@ -145,6 +146,15 @@ polly:                       # -ldp
 # Install LangSmith Deployment + Fleet + Insights + Polly (all add-ons)
 ./smith-fly.sh up -ldaip
 
+# OAuth login via Keycloak over HTTPS (see "OAuth / SSO via Keycloak" below)
+./smith-fly.sh up -ld --auth keycloak
+
+# OAuth + SSO Groups Sync (group claims -> roles; chart >= 0.15.0-rc.3)
+./smith-fly.sh up -ld --auth keycloak --provisioning groups-sync
+
+# OAuth + SCIM (Keycloak pushes users/groups outbound to LangSmith)
+./smith-fly.sh up -ld --auth keycloak --provisioning scim
+
 # Uninstall LangSmith from ALL namespaces (auto-discovers deployments)
 ./smith-fly.sh down
 
@@ -182,6 +192,8 @@ Options:
     -v              Specify version (optional)
     -n              Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i              Ingress type: alb or nginx (auto-detected if not specified)
+    --auth          basic|keycloak (default basic). keycloak = OAuth/OIDC login over HTTPS
+    --provisioning  none|groups-sync|scim (default none; requires --auth keycloak)
 ```
 
 > **Namespace rules**: The `-n` value must start with a lowercase letter (`a-z`), contain only lowercase alphanumeric characters or hyphens, and be at most 63 characters. Purely numeric namespaces (e.g., `15265`) are rejected because they cause Helm YAML serialization errors. Use a prefixed name instead (e.g., `ls-15265`).
@@ -225,6 +237,68 @@ EOF
 ```bash
 ./smith-fly.sh up -l
 ```
+
+## OAuth / SSO via Keycloak
+
+`--auth keycloak` delegates LangSmith login to a Keycloak OIDC provider, and
+`--provisioning` chooses how org/workspace roles flow into LangSmith. OAuth is the
+shared base layer; provisioning is a switch on top. Full design + constraints:
+[`docs/keycloak-oauth-scim.md`](docs/keycloak-oauth-scim.md).
+
+> **Enterprise license required** — SSO and SCIM are LangSmith Enterprise features.
+> OAuth requires **HTTPS**: the keycloak path generates a self-signed cert, stores it
+> as the `langsmith-tls` secret, and enables `config.deployment.tlsEnabled`.
+
+**Local (minikube + Docker) quickstart:**
+
+```bash
+# 1. Bring up Keycloak (imports keycloak/realm-langsmith.json). Use a host the
+#    LangSmith pods can also resolve (issuer reachability, see doc §5.2).
+./scripts/keycloak.sh up --ls-host langsmith.localhost --kc-host keycloak.localhost
+
+# 2. Copy the printed KEYCLOAK_ISSUER_URL / OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET
+#    into config/.env (see config/.env.example).
+
+# 3. Install LangSmith with OAuth + groups-sync
+./smith-fly.sh up -ld --auth keycloak --provisioning groups-sync -v 0.15.2
+
+# 4. Enable SSO Groups Sync post-install (groups claim = "groups")
+./scripts/configure-groups-sync.sh https://<endpoint> <org-admin-PAT>
+
+# Tear down Keycloak when done
+./scripts/keycloak.sh down
+```
+
+Seed users in the realm: `ls-admin` (`LS:Organization Admins`) and `ls-editor`
+(`LS:Organization User:Production:Editor`), both password `Passw0rd!`.
+
+**SCIM** (`--provisioning scim`) additionally needs the third-party outbound-SCIM
+extension JAR ([`mitodl/keycloak-scim`](https://github.com/mitodl/keycloak-scim))
+mounted into Keycloak (`SCIM_JAR=/path/to.jar ./scripts/keycloak.sh up ...`), a LangSmith
+SCIM token (`./scripts/scim-token.sh <endpoint> <org-admin-PAT>`), and registering the
+target in Keycloak (`./scripts/configure-scim.sh --token <scim-token>`). The Keycloak
+container reaches LangSmith's SCIM endpoint via `host.docker.internal:1986` after
+`kubectl port-forward svc/langsmith-platform-backend -n <ns> 1986:1986`.
+
+Verified locally (KC 26.6, chart 0.15.12): SCIM **create / update / deactivate** propagate
+Keycloak → LangSmith. **Known limitation:** SCIM **hard-delete does not propagate** on
+Keycloak 26.x — the Sep-2024 extension NPEs in its delete handler. Deprovision by *disabling*
+users in Keycloak (propagates as `active=false`), not deleting.
+
+**Caveats:** OAuth and basic auth cannot coexist, and self-hosted does not support
+reverting OAuth → basic in place — switch back by tearing down (`down`) and
+reinstalling. Disable JIT when provisioning is active (the script sets
+`SELF_HOSTED_JIT_PROVISIONING_ENABLED=false` automatically).
+
+### EKS / production deltas
+
+- Real hostname + ACM/real TLS — no self-signed cert, no `nip.io`. Point `--ls-host`
+  at the real DNS name and skip the `langsmith-tls` self-signed secret.
+- Run Keycloak as its own Helm release or use a fully external IdP — not the local
+  Docker container. Set `KEYCLOAK_ISSUER_URL` to that provider's issuer.
+- In-cluster reachability is simpler (real DNS resolves everywhere), avoiding the
+  split-horizon issuer problem.
+- For SCIM, open the network path IdP → `/scim/v2` (security groups / ingress).
 
 ## Resource Usage
 
@@ -348,11 +422,17 @@ smith-fly/
 ├── README.md               # This file
 ├── .gitignore              # Git ignore file (excludes .env and generated configs)
 ├── config/
-│   ├── .env                # User configuration (license, email) - DO NOT COMMIT!
+│   ├── .env                # User configuration (license, email, Keycloak coords) - DO NOT COMMIT!
 │   ├── config.yaml         # Base Helm values (includes minimal resource config)
 │   └── ls_config.yaml      # Generated LangSmith config (temporary)
+├── keycloak/
+│   └── realm-langsmith.json  # Keycloak realm import (client, role groups, seed users)
 └── scripts/
     ├── populate.sh         # Synthetic data population (traces, feedback, datasets, prompts)
+    ├── keycloak.sh         # Local Keycloak (Docker) up/down for --auth keycloak
+    ├── scim-token.sh       # Generate a LangSmith SCIM bearer token (--provisioning scim)
+    ├── configure-groups-sync.sh  # Enable SSO Groups Sync post-install (--provisioning groups-sync)
+    ├── configure-scim.sh   # Register LangSmith as a SCIM target in Keycloak (--provisioning scim)
     └── mac/
         └── minikube.sh     # macOS Minikube starter with auto resource detection
 ```

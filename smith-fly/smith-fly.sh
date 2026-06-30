@@ -47,6 +47,18 @@ fleetEncryptionKey=""  # Fernet key for Fleet (auto-generated or preserved)
 insightsEncryptionKey=""      # Fernet key for Insights (auto-generated or preserved)
 pollyEncryptionKey=""         # Fernet key for Polly (auto-generated or preserved)
 
+# Authentication / provisioning (Keycloak OAuth/OIDC). Default path is unchanged
+# basic auth; --auth keycloak swaps in the OAuth block and --provisioning selects
+# how org/workspace roles flow into LangSmith. See docs/keycloak-oauth-scim.md.
+AUTH_MODE="basic"            # basic | keycloak
+PROVISIONING_MODE="none"     # none | groups-sync | scim
+# Keycloak coordinates (sourced from config/.env when --auth keycloak)
+KEYCLOAK_ISSUER_URL=""       # e.g. https://keycloak.<host>/realms/langsmith
+OAUTH_CLIENT_ID=""
+OAUTH_CLIENT_SECRET=""
+OAUTH_SCOPES=""              # optional override; defaults to "email,profile,openid"
+ISSUER_SUB_CLAIM_OVERRIDES="" # optional; e.g. "oid" when sub != SCIM externalId
+
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -415,7 +427,12 @@ Options (for 'up' action):
     -v      Specify version (optional)
     -n      Custom namespace (must start with a letter, lowercase alphanumeric/hyphens, max 63 chars)
     -i      Ingress type: alb or nginx (auto-detected if not specified)
-  
+    --auth          basic|keycloak (default basic). keycloak delegates login to Keycloak
+                    via OAuth/OIDC (requires HTTPS + Keycloak coords in ${ENV_FILE}).
+    --provisioning  none|groups-sync|scim (default none). Requires --auth keycloak.
+                    groups-sync: LangSmith reads group claims at login (chart >= 0.15.0-rc.3).
+                    scim: Keycloak pushes users/groups outbound (needs SCIM extension + token).
+
 
 Examples:
     $0 up -l                     # Install LangSmith (ingress auto-detected based on cluster)
@@ -435,6 +452,9 @@ Examples:
     $0 up -ldai                  # Install LangSmith Deployment + Fleet + Insights
     $0 up -ldip                  # Install LangSmith Deployment + Insights + Polly
     $0 up -ldaip                 # Install LangSmith Deployment + Fleet + Insights + Polly
+    $0 up -ld --auth keycloak                          # OAuth login via Keycloak (HTTPS), no provisioning
+    $0 up -ld --auth keycloak --provisioning groups-sync  # OAuth + SSO Groups Sync (chart >= 0.15.0-rc.3)
+    $0 up -ld --auth keycloak --provisioning scim      # OAuth + SCIM (outbound from Keycloak)
     $0 down                      # Remove LangSmith from ALL namespaces (auto-discovers deployments)
     $0 down -n my-namespace      # Remove LangSmith from a specific namespace only
     $0 status                    # Check installation status of LangSmith and LangSmith Deployment
@@ -453,6 +473,10 @@ Notes:
     - Version < 0.12.0 uses legacy config format (config.langgraphPlatform, langgraphPlatformLicenseKey)
     - Ingress type is auto-detected: AWS EKS -> ALB, other clusters -> nginx
     - Use -i flag to override auto-detection (e.g., -i alb or -i nginx)
+    - --auth keycloak requires Keycloak running first (scripts/keycloak.sh up) and
+      KEYCLOAK_ISSUER_URL / OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET set in ${ENV_FILE}
+    - OAuth + SSO/SCIM are LangSmith Enterprise features; the license key must enable them
+    - Switching --auth is one-directional in self-hosted: revert with "down" + reinstall
 
 EOF
     exit 1
@@ -595,6 +619,38 @@ parse_arguments() {
                 esac
                 shift 2
                 ;;
+            --auth)
+                if [ $# -lt 2 ]; then
+                    log ERROR "--auth option requires an argument (basic or keycloak)"
+                    show_usage
+                fi
+                case "$2" in
+                    basic|keycloak)
+                        AUTH_MODE="$2"
+                        ;;
+                    *)
+                        log ERROR "Invalid auth mode: $2. Must be 'basic' or 'keycloak'"
+                        show_usage
+                        ;;
+                esac
+                shift 2
+                ;;
+            --provisioning)
+                if [ $# -lt 2 ]; then
+                    log ERROR "--provisioning option requires an argument (none, groups-sync, or scim)"
+                    show_usage
+                fi
+                case "$2" in
+                    none|groups-sync|scim)
+                        PROVISIONING_MODE="$2"
+                        ;;
+                    *)
+                        log ERROR "Invalid provisioning mode: $2. Must be 'none', 'groups-sync', or 'scim'"
+                        show_usage
+                        ;;
+                esac
+                shift 2
+                ;;
             --config-dir)
                 if [ $# -lt 2 ]; then
                     log ERROR "--config-dir option requires a directory argument"
@@ -630,6 +686,22 @@ parse_arguments() {
         fi
     fi
 
+    # Validate authentication / provisioning flag relationships (for 'up').
+    # The .env value checks happen later in validate_auth_config (after .env is sourced).
+    if [ "$ACTION" = "up" ]; then
+        # OAuth is orthogonal to the install flavor (works with -l, -ld, and add-ons).
+        # Provisioning automation only makes sense with OAuth — it layers on top of it.
+        if [ "$PROVISIONING_MODE" != "none" ] && [ "$AUTH_MODE" != "keycloak" ]; then
+            log ERROR "--provisioning ${PROVISIONING_MODE} requires --auth keycloak"
+            show_usage
+        fi
+        # SSO Groups Sync first shipped in chart 0.15.0-rc.3; reuse the v15+ guard.
+        if [ "$PROVISIONING_MODE" = "groups-sync" ] && ! is_version_v15_plus "$VERSION"; then
+            log ERROR "--provisioning groups-sync requires chart version >= 0.15.0-rc.3. Specified: ${VERSION:-latest}"
+            exit 1
+        fi
+    fi
+
     # For 'down' action, remove both regardless of flags
     if [ "$ACTION" = "down" ]; then
         INSTALL_LS=true
@@ -645,6 +717,8 @@ parse_arguments() {
         log INFO "Install Fleet: ${INSTALL_AB}"
         log INFO "Install Insights: ${INSTALL_INSIGHTS}"
         log INFO "Install Polly: ${INSTALL_POLLY}"
+        log INFO "Auth Mode: ${AUTH_MODE}"
+        log INFO "Provisioning Mode: ${PROVISIONING_MODE}"
         log INFO "Ingress Type: ${INGRESS_TYPE}"
         
         if [ -n "$VERSION" ]; then
@@ -693,6 +767,33 @@ load_configuration() {
     fi
     
     log SUCCESS "Configuration loaded successfully"
+}
+
+##############################################################################
+# Function: validate_auth_config
+# Description: Validates Keycloak OAuth prerequisites. Runs AFTER load_configuration
+#              so the .env-sourced OAuth coordinates are available.
+##############################################################################
+validate_auth_config() {
+    if [ "$AUTH_MODE" != "keycloak" ]; then
+        return 0
+    fi
+
+    log INFO "Validating Keycloak OAuth configuration..."
+
+    local missing=()
+    [ -z "${KEYCLOAK_ISSUER_URL:-}" ] && missing+=("KEYCLOAK_ISSUER_URL")
+    [ -z "${OAUTH_CLIENT_ID:-}" ]     && missing+=("OAUTH_CLIENT_ID")
+    [ -z "${OAUTH_CLIENT_SECRET:-}" ] && missing+=("OAUTH_CLIENT_SECRET")
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        log ERROR "--auth keycloak requires these values in ${ENV_FILE}: ${missing[*]}"
+        log ERROR "Add them to ${ENV_FILE} (see config/.env.example). Bring up Keycloak first with:"
+        log ERROR "    ${SCRIPT_DIR}/scripts/keycloak.sh up"
+        exit 1
+    fi
+
+    log SUCCESS "Keycloak OAuth configuration is valid"
 }
 
 ##############################################################################
@@ -1101,6 +1202,275 @@ load_existing_secrets() {
 }
 
 ##############################################################################
+# Function: setup_local_tls
+# Description: Generates a self-signed cert for the LangSmith host and stores it as
+#              a k8s TLS secret (langsmith-tls). LangSmith SSO requires HTTPS (§5.1).
+#              On EKS this is replaced by real DNS + ACM — no logic change to callers.
+# Arguments:  $1 - bare hostname (no scheme), e.g. langsmith.192-168-49-2.nip.io
+##############################################################################
+setup_local_tls() {
+    local host="$1"
+
+    if [ -z "$host" ]; then
+        log WARNING "setup_local_tls called with empty host — skipping TLS secret"
+        return 1
+    fi
+
+    log INFO "Generating self-signed TLS cert for ${host}..."
+    local certdir
+    certdir=$(mktemp -d)
+
+    # SAN covers the ingress host plus localhost (port-forward access).
+    if ! openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "${certdir}/tls.key" -out "${certdir}/tls.crt" \
+        -days 365 -subj "/CN=${host}" \
+        -addext "subjectAltName=DNS:${host},DNS:localhost" 2>/dev/null; then
+        log ERROR "Failed to generate self-signed certificate"
+        rm -rf "$certdir"
+        return 1
+    fi
+
+    log INFO "Creating/updating TLS secret langsmith-tls in namespace ${NAMESPACE}..."
+    kubectl create secret tls langsmith-tls \
+        --cert="${certdir}/tls.crt" --key="${certdir}/tls.key" \
+        -n "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+    rm -rf "$certdir"
+    log SUCCESS "TLS secret langsmith-tls ready"
+}
+
+##############################################################################
+# Function: setup_oauth_ca_trust
+# Description: Builds a CA bundle (public CAs + the Keycloak server cert) and stores
+#              it in a secret the platform-backend trusts via config.customCa (§5.1).
+#              Without this, the OIDC client rejects Keycloak's self-signed cert
+#              ("x509: certificate signed by unknown authority") and panics.
+#              Public CAs are kept in the bundle so beacon/playground TLS still works.
+#              No-op unless the issuer is https. Returns 0 on success.
+##############################################################################
+setup_oauth_ca_trust() {
+    case "${KEYCLOAK_ISSUER_URL:-}" in
+        https://*) ;;
+        *) log INFO "OIDC issuer is not https — skipping custom CA trust"; return 0 ;;
+    esac
+
+    # Parse host:port from the issuer URL.
+    local hostport host port
+    hostport="${KEYCLOAK_ISSUER_URL#https://}"
+    hostport="${hostport%%/*}"
+    host="${hostport%%:*}"
+    if [ "$hostport" = "$host" ]; then port=443; else port="${hostport##*:}"; fi
+
+    local workdir
+    workdir=$(mktemp -d)
+
+    # Fetch the cert Keycloak actually serves. Connect to localhost (Docker publishes
+    # the port there) but send the real SNI so we get the right leaf cert.
+    log INFO "Fetching Keycloak server cert (${host}:${port}) for OIDC CA trust..."
+    if ! openssl s_client -connect "127.0.0.1:${port}" -servername "$host" </dev/null 2>/dev/null \
+        | openssl x509 -out "${workdir}/kc.crt" 2>/dev/null; then
+        log WARNING "Could not fetch Keycloak cert from 127.0.0.1:${port}; OIDC TLS verification may fail"
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    # Append the Keycloak cert to a public CA bundle so outbound TLS (beacon, etc.)
+    # keeps working alongside trusting Keycloak.
+    local pubca=""
+    local c
+    for c in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+        [ -f "$c" ] && { pubca="$c"; break; }
+    done
+    if [ -n "$pubca" ]; then
+        cat "$pubca" "${workdir}/kc.crt" > "${workdir}/ca-bundle.crt"
+    else
+        log WARNING "No public CA bundle found on host; trusting Keycloak cert only (beacon TLS may fail)"
+        cp "${workdir}/kc.crt" "${workdir}/ca-bundle.crt"
+    fi
+
+    log INFO "Creating/updating OIDC CA trust secret langsmith-oauth-ca in namespace ${NAMESPACE}..."
+    # Use delete+create (not apply): the full CA bundle exceeds kubectl apply's
+    # 256KB last-applied-configuration annotation limit, though it's well under the
+    # 1MB secret data limit.
+    kubectl delete secret langsmith-oauth-ca -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
+    kubectl create secret generic langsmith-oauth-ca \
+        --from-file=ca.crt="${workdir}/ca-bundle.crt" \
+        -n "$NAMESPACE"
+
+    rm -rf "$workdir"
+    log SUCCESS "OIDC CA trust secret langsmith-oauth-ca ready"
+}
+
+##############################################################################
+# Function: resolve_oauth_host
+# Description: Resolves the bare LangSmith host (no scheme) used for OAuth redirect
+#              URIs + the TLS cert. Used by install paths that don't otherwise
+#              resolve an ingress hostname (e.g. plain -l). Honors LANGSMITH_HOSTNAME.
+# Returns: bare host via stdout
+##############################################################################
+resolve_oauth_host() {
+    if [ -n "${LANGSMITH_HOSTNAME:-}" ]; then
+        echo "$LANGSMITH_HOSTNAME"
+        return
+    fi
+    if is_minikube_cluster; then
+        local ip
+        ip=$(minikube ip 2>/dev/null || echo "")
+        if [ -n "$ip" ]; then
+            echo "${ip}.nip.io"
+            return
+        fi
+        echo "localhost"
+        return
+    fi
+    local h
+    h=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+    [ -z "$h" ] && h=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+    if [ -n "$h" ]; then
+        echo "$h"
+        return
+    fi
+    echo "localhost"
+}
+
+##############################################################################
+# Function: apply_oauth_hostname_tls
+# Description: Applies the OAuth-required hostname + TLS to ls_config.yaml, so it
+#              works for ANY install flavor (-l, -ld, fleet/insights/polly) — OAuth
+#              is orthogonal to the feature flags. Injects config.hostname with the
+#              https scheme, flips config.deployment.tlsEnabled, adds ingress.tls,
+#              and provisions the self-signed cert + secret. Idempotent within a run
+#              (ls_config is rebuilt fresh from config.yaml each install).
+# Arguments:  $1 - bare hostname (no scheme)
+##############################################################################
+apply_oauth_hostname_tls() {
+    local host="$1"
+    log INFO "Applying OAuth hostname + TLS (host: ${host})..."
+
+    # config.hostname with https scheme (§5.1). Replace if present, else insert.
+    if grep -qE '^  hostname:' "$LS_CONFIG_YAML"; then
+        $SED_CMD -i.bak "s|^  hostname:.*|  hostname: \"https://${host}\"|" "$LS_CONFIG_YAML"
+        rm -f "${LS_CONFIG_YAML}.bak"
+    else
+        local hi
+        hi=$(mktemp)
+        echo "  hostname: \"https://${host}\"" > "$hi"
+        $SED_CMD -i.bak "/^config:/r $hi" "$LS_CONFIG_YAML"
+        rm -f "$hi" "${LS_CONFIG_YAML}.bak"
+    fi
+
+    # Flip config.deployment.tlsEnabled false -> true (scoped to the deployment block).
+    $SED_CMD -i.bak '/^  deployment:$/,/^[^ ]/{ s/tlsEnabled: false/tlsEnabled: true/ }' "$LS_CONFIG_YAML"
+    rm -f "${LS_CONFIG_YAML}.bak"
+
+    # Add ingress.tls referencing the secret created below.
+    local ti
+    ti=$(mktemp)
+    cat > "$ti" << EOF
+  tls:
+    - secretName: langsmith-tls
+      hosts:
+        - "${host}"
+EOF
+    $SED_CMD -i.bak "/^ingress:/r $ti" "$LS_CONFIG_YAML"
+    rm -f "$ti" "${LS_CONFIG_YAML}.bak"
+
+    setup_local_tls "$host"
+
+    # Trust the Keycloak (self-signed) cert so the OIDC client can fetch the
+    # discovery doc / JWKS without an x509 verification panic (§5.1).
+    setup_oauth_ca_trust
+}
+
+##############################################################################
+# Function: inject_oauth_config
+# Description: Swaps the basicAuth block in ls_config.yaml for a Keycloak oauth
+#              block. OAuth and basic auth cannot coexist in LangSmith, so the
+#              basicAuth block is removed entirely. Only called when AUTH_MODE=keycloak.
+##############################################################################
+inject_oauth_config() {
+    log INFO "Configuring Keycloak OAuth (replacing basic auth)..."
+
+    # Remove the basicAuth block (config: > basicAuth: ... jwtSecret:). The secret
+    # sed replacements in create_langsmith_config become harmless no-ops once it's gone.
+    $SED_CMD -i.bak '/^  basicAuth:/,/^    jwtSecret:/d' "$LS_CONFIG_YAML"
+    rm -f "${LS_CONFIG_YAML}.bak"
+
+    # Determine OAuth scopes. groups-sync needs the group claim in the token.
+    local scopes="email,profile,openid"
+    [ -n "${OAUTH_SCOPES:-}" ] && scopes="$OAUTH_SCOPES"
+    if [ "$PROVISIONING_MODE" = "groups-sync" ] && [[ "$scopes" != *groups* ]]; then
+        scopes="${scopes},groups"
+    fi
+
+    # Insert the oauth block after the authType line (same temp-file 'r' idiom used
+    # elsewhere for hostname / langgraphPlatform injection). Also re-add
+    # initialOrgAdminEmail at config level: the base config.yaml nests it under the
+    # basicAuth block we just deleted, but OAuth bootstrap reads config.initialOrgAdminEmail
+    # (INITIAL_ORG_ADMIN_EMAIL) — without it the auth-bootstrap job fails.
+    local temp_insert
+    temp_insert=$(mktemp)
+    cat > "$temp_insert" << EOF
+  initialOrgAdminEmail: "${initialOrgAdminEmail}"
+  oauth:
+    enabled: true
+    oauthClientId: "${OAUTH_CLIENT_ID}"
+    oauthClientSecret: "${OAUTH_CLIENT_SECRET}"
+    oauthIssuerUrl: "${KEYCLOAK_ISSUER_URL}"
+    oauthScopes: "${scopes}"
+EOF
+    $SED_CMD -i.bak "/authType:/r $temp_insert" "$LS_CONFIG_YAML"
+    rm -f "$temp_insert" "${LS_CONFIG_YAML}.bak"
+
+    log SUCCESS "OAuth block injected (issuer: ${KEYCLOAK_ISSUER_URL}, scopes: ${scopes})"
+}
+
+##############################################################################
+# Function: oauth_helm_set_flags
+# Description: Echoes the helm --set flags for OAuth session/JIT env vars, to be
+#              appended to the helm upgrade command. Empty unless AUTH_MODE=keycloak.
+#              These go via --set (not YAML injection) to avoid fragile anchor edits
+#              into platformBackend.deployment / commonEnv.
+##############################################################################
+oauth_helm_set_flags() {
+    [ "$AUTH_MODE" != "keycloak" ] && return 0
+
+    local flags=""
+    # Session controls + IdP-initiated logout (Phase 1).
+    flags+=" --set platformBackend.deployment.extraEnv[0].name=OAUTH_SESSION_MAX_SEC"
+    flags+=" --set-string platformBackend.deployment.extraEnv[0].value=86400"
+    flags+=" --set platformBackend.deployment.extraEnv[1].name=OAUTH_IDP_LOGOUT_ENABLED"
+    flags+=" --set-string platformBackend.deployment.extraEnv[1].value=true"
+
+    local idx=2
+    # Override which OIDC claim maps to LangSmith's sub when it differs from the
+    # SCIM externalId (§5.2). Only set when provided in .env.
+    if [ -n "${ISSUER_SUB_CLAIM_OVERRIDES:-}" ]; then
+        flags+=" --set platformBackend.deployment.extraEnv[${idx}].name=ISSUER_SUB_CLAIM_OVERRIDES"
+        flags+=" --set-string platformBackend.deployment.extraEnv[${idx}].value=${ISSUER_SUB_CLAIM_OVERRIDES}"
+        idx=$((idx + 1))
+    fi
+
+    # JIT provisioning conflicts with both groups-sync and SCIM — disable it (§6/§8).
+    # commonEnv is a list of {name,value} in the chart (defaults to []), so set by index.
+    if [ "$PROVISIONING_MODE" != "none" ]; then
+        flags+=" --set commonEnv[0].name=SELF_HOSTED_JIT_PROVISIONING_ENABLED"
+        flags+=" --set-string commonEnv[0].value=false"
+    fi
+
+    # Trust the Keycloak self-signed cert (bundle created by setup_oauth_ca_trust) so
+    # the OIDC discovery/JWKS fetch passes TLS verification (§5.1). https issuer only.
+    case "${KEYCLOAK_ISSUER_URL:-}" in
+        https://*)
+            flags+=" --set config.customCa.secretName=langsmith-oauth-ca"
+            flags+=" --set config.customCa.secretKey=ca.crt"
+            ;;
+    esac
+
+    echo "$flags"
+}
+
+##############################################################################
 # Function: create_langsmith_config
 # Description: Creates LangSmith configuration file with substituted values
 ##############################################################################
@@ -1197,7 +1567,12 @@ create_langsmith_config() {
     
     # Remove backup file
     rm -f "${LS_CONFIG_YAML}.bak"
-    
+
+    # Swap basic auth for Keycloak OAuth when requested.
+    if [ "$AUTH_MODE" = "keycloak" ]; then
+        inject_oauth_config
+    fi
+
     log SUCCESS "LangSmith configuration file created: ${LS_CONFIG_YAML}"
 }
 
@@ -1210,13 +1585,21 @@ install_langsmith() {
     
     # Create configuration
     create_langsmith_config
-    
+
+    # OAuth is orthogonal to the install flavor: apply hostname + TLS here too so
+    # plain -l (no deployment) gets a working HTTPS OAuth setup.
+    if [ "$AUTH_MODE" = "keycloak" ]; then
+        local oauth_host
+        oauth_host=$(resolve_oauth_host)
+        apply_oauth_hostname_tls "$oauth_host"
+    fi
+
     # Scope operator to this namespace in the values file to ensure the chart
     # renders namespaced Role/RoleBinding instead of cluster-scoped ClusterRole.
     log INFO "Setting operator.watchNamespaces=${NAMESPACE} in values file"
     $SED_CMD -i.bak "s/watchNamespaces:.*/watchNamespaces: \"${NAMESPACE}\"/" "$LS_CONFIG_YAML"
     rm -f "${LS_CONFIG_YAML}.bak"
-    
+
     # Build helm command (quote paths to handle spaces in directory names)
     local helm_cmd="helm upgrade --install langsmith langchain/langsmith"
     helm_cmd+=" --namespace \"${NAMESPACE}\""
@@ -1256,12 +1639,23 @@ install_langsmith() {
         helm_cmd+=" --set operator.kedaEnabled=false"
     fi
     
+    # On chart 0.15.x the agent-feature products (fleet/insights/polly) default to
+    # enabled=true and then require an encryptionKey each. A plain LangSmith (-l)
+    # install requests none of them, so disable them to satisfy chart validation.
+    # (The -ld path does the same in install_langsmith_deployment.)
+    [ "$INSTALL_AB" = true ]       || helm_cmd+=" --set fleet.enabled=false"
+    [ "$INSTALL_INSIGHTS" = true ] || helm_cmd+=" --set insights.enabled=false"
+    [ "$INSTALL_POLLY" = true ]    || helm_cmd+=" --set polly.enabled=false"
+
+    # Add OAuth session/JIT env flags (no-op unless --auth keycloak)
+    helm_cmd+="$(oauth_helm_set_flags)"
+
     # Add debug flag if enabled
     if [ "$DEBUG" = true ]; then
         helm_cmd+=" --debug"
         log INFO "Debug mode enabled"
     fi
-    
+
     # Execute helm install with live pod progress
     helm_with_progress "$helm_cmd"
 
@@ -1579,12 +1973,18 @@ install_langsmith_deployment() {
         $SED_CMD -i.bak '/^  deployment:$/{n; s/enabled: false/enabled: true/}' "$LS_CONFIG_YAML"
         rm -f "${LS_CONFIG_YAML}.bak"
 
-        # Inject hostname under the 'config:' block
-        local temp_insert
-        temp_insert=$(mktemp)
-        echo "  hostname: \"${ingress_hostname}\"" > "$temp_insert"
-        $SED_CMD -i.bak "/^config:/r $temp_insert" "$LS_CONFIG_YAML"
-        rm -f "$temp_insert" "${LS_CONFIG_YAML}.bak"
+        # Inject hostname under the 'config:' block. For OAuth, the hostname must
+        # carry the https:// scheme + TLS (§5.1) — shared helper, flavor-agnostic.
+        # Basic auth keeps the scheme-less hostname.
+        if [ "$AUTH_MODE" = "keycloak" ]; then
+            apply_oauth_hostname_tls "$ingress_hostname"
+        else
+            local temp_insert
+            temp_insert=$(mktemp)
+            echo "  hostname: \"${ingress_hostname}\"" > "$temp_insert"
+            $SED_CMD -i.bak "/^config:/r $temp_insert" "$LS_CONFIG_YAML"
+            rm -f "$temp_insert" "${LS_CONFIG_YAML}.bak"
+        fi
 
         # Append top-level fleet / insights / polly blocks (chart >= 0.15 model).
         # These are standalone Helm-managed Deployments — NOT the deprecated
@@ -1664,8 +2064,9 @@ install_langsmith_deployment() {
         if [ "$INSTALL_AB" = true ]; then
             helm_cmd+=" --set fleetToolServer.enabled=true"
             helm_cmd+=" --set fleetTriggerServer.enabled=true"
-            if is_minikube_cluster; then
-                # Self-signed TLS doesn't verify inside the cluster; disable for local dev.
+            # Self-signed TLS doesn't verify inside the cluster; disable for local dev.
+            # The keycloak path REQUIRES TLS (OAuth over HTTPS, §5.1), so keep it on there.
+            if is_minikube_cluster && [ "$AUTH_MODE" != "keycloak" ]; then
                 helm_cmd+=" --set config.tlsEnabled=false"
                 helm_cmd+=" --set config.deployment.ingressHealthCheckEnabled=false"
             fi
@@ -1677,6 +2078,9 @@ install_langsmith_deployment() {
         [ "$INSTALL_AB" = true ]       || helm_cmd+=" --set fleet.enabled=false"
         [ "$INSTALL_INSIGHTS" = true ] || helm_cmd+=" --set insights.enabled=false"
         [ "$INSTALL_POLLY" = true ]    || helm_cmd+=" --set polly.enabled=false"
+
+        # Add OAuth session/JIT env flags (no-op unless --auth keycloak)
+        helm_cmd+="$(oauth_helm_set_flags)"
 
         if [ "$DEBUG" = true ]; then
             helm_cmd+=" --debug"
@@ -1897,6 +2301,10 @@ display_langsmith_info() {
         endpoint="YOUR_LANGSMITH_ENDPOINT"
     fi
     
+    # OAuth/Keycloak serves over HTTPS; basic auth over HTTP.
+    local scheme="http"
+    [ "$AUTH_MODE" = "keycloak" ] && scheme="https"
+
     echo ""
     echo "=========================================================================="
     echo -e "${GREEN}LangSmith Installation Complete!${NC}"
@@ -1912,12 +2320,30 @@ display_langsmith_info() {
         echo -e "    ${GREEN}kubectl get ingress -n ${NAMESPACE}${NC}"
         echo -e "    ${GREEN}kubectl get svc langsmith-frontend -n ${NAMESPACE}${NC}"
     else
-        echo -e "Endpoint:  ${GREEN}http://${endpoint}${NC}"
+        echo -e "Endpoint:  ${GREEN}${scheme}://${endpoint}${NC}"
     fi
-    echo -e "Email:     ${GREEN}${initialOrgAdminEmail}${NC}"
-    echo -e "Password:  ${GREEN}${initialOrgAdminPassword}${NC}"
-    echo ""
-    echo -e "${YELLOW}⚠️  Important: Save these credentials securely!${NC}"
+    if [ "$AUTH_MODE" = "keycloak" ]; then
+        echo -e "Login:     ${GREEN}Sign in via Keycloak (OAuth/OIDC)${NC}"
+        echo -e "Keycloak:  ${GREEN}${KEYCLOAK_ISSUER_URL}${NC}"
+        echo -e "Provision: ${GREEN}${PROVISIONING_MODE}${NC}"
+        echo ""
+        echo -e "${YELLOW}⚠️  Self-signed TLS: your browser will warn on first visit (expected for local).${NC}"
+        case "$PROVISIONING_MODE" in
+            groups-sync)
+                echo -e "${YELLOW}    Next: enable SSO Groups Sync (groups claim = 'groups'):${NC}"
+                echo -e "    ${GREEN}${SCRIPT_DIR}/scripts/configure-groups-sync.sh ${scheme}://${endpoint} <org-admin-PAT>${NC}"
+                ;;
+            scim)
+                echo -e "${YELLOW}    Next: generate a SCIM token and load the outbound-SCIM extension in Keycloak:${NC}"
+                echo -e "    ${GREEN}${SCRIPT_DIR}/scripts/scim-token.sh ${scheme}://${endpoint} <org-admin-PAT>${NC}"
+                ;;
+        esac
+    else
+        echo -e "Email:     ${GREEN}${initialOrgAdminEmail}${NC}"
+        echo -e "Password:  ${GREEN}${initialOrgAdminPassword}${NC}"
+        echo ""
+        echo -e "${YELLOW}⚠️  Important: Save these credentials securely!${NC}"
+    fi
     if [ "$is_minikube" = true ]; then
         echo ""
         echo -e "${YELLOW}⚠️  Minikube Note: Port-forward is running in the background.${NC}"
@@ -1935,7 +2361,7 @@ display_langsmith_info() {
 import os
 
 os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_ENDPOINT"] = "http://${endpoint}/api/v1"
+os.environ["LANGSMITH_ENDPOINT"] = "${scheme}://${endpoint}/api/v1"
 os.environ["LANGSMITH_API_KEY"] = "YOUR_KEY"
 os.environ["OPENAI_API_KEY"] = "YOUR_KEY"
 os.environ["LANGSMITH_PROJECT"] = "YOUR_PROJECT"
@@ -1952,7 +2378,7 @@ EOF
 
     # Export resolved endpoint for use by populate and other post-install steps
     if [ "$endpoint_pending" != true ] && [ -n "$endpoint" ]; then
-        RESOLVED_ENDPOINT="http://${endpoint}"
+        RESOLVED_ENDPOINT="${scheme}://${endpoint}"
     fi
 }
 
@@ -2156,7 +2582,10 @@ main() {
         
         # Load configuration
         load_configuration
-        
+
+        # Validate Keycloak OAuth prerequisites (no-op unless --auth keycloak)
+        validate_auth_config
+
         # Setup Helm repository
         setup_helm_repo
         

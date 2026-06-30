@@ -21,3 +21,6 @@ config/ld_config.yaml
 *.swo
 *~
 
+
+# Local Keycloak self-signed certs (persistent across keycloak.sh runs)
+keycloak/.certs/
