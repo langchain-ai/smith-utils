@@ -292,6 +292,15 @@ The script **auto-detects** the cluster type and configures the appropriate ingr
 | **Other clusters** | nginx        | Default for GKE, AKS, on-premise, k3s, etc.                     |
 
 
+**Minikube port-forward port:**
+
+| Flavor   | Port   | URL                     | Notes |
+| -------- | ------ | ----------------------- | ----- |
+| `-l`     | `8080` | `http://localhost:8080` | No sudo needed |
+| `-ld*`   | `80`   | `http://localhost`      | Prompts for your **sudo** password (privileged port) |
+
+With LangSmith Deployment, the chart derives every public URL from `config.hostname` (`localhost`, no port), e.g. deployment API URLs `http://localhost/lgp/<name>` used by Studio and the **Connect** dialog. A port can't be added to the hostname because the chart also uses it as the Ingress host rule, so the ingress must be reachable on port 80 — otherwise the UI shows the deployment as *Unknown* and "Failed to load assistants: Failed to fetch". If sudo is unavailable the script falls back to `8080` and prints the command to start the `:80` forward yourself. Override with `MINIKUBE_PORT=<port>` in the environment or `config/.env`.
+
 Use the `-i` flag to override auto-detection if needed:
 
 ```bash

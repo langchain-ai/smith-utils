@@ -43,6 +43,7 @@ initialOrgAdminPassword=""
 POPULATE=false  # Whether to run populate.sh after install
 RESOLVED_ENDPOINT=""  # Set by display_langsmith_info for use by populate
 LANGSMITH_HOSTNAME=""  # Optional: custom hostname for LangSmith (can be set via .env)
+MINIKUBE_PORT="${MINIKUBE_PORT:-}"  # Local port-forward port on Minikube (auto: 80 for -ld*, 8080 otherwise; can be set via .env)
 fleetEncryptionKey=""  # Fernet key for Fleet (auto-generated or preserved)
 insightsEncryptionKey=""      # Fernet key for Insights (auto-generated or preserved)
 pollyEncryptionKey=""         # Fernet key for Polly (auto-generated or preserved)
@@ -298,37 +299,100 @@ is_keda_installed() {
 }
 
 ##############################################################################
+# Function: resolve_minikube_port
+# Description: Picks the local port-forward port for Minikube.
+#   With LangSmith Deployment (-ld*), the chart derives every public URL from
+#   config.hostname ("localhost", no port): deployment API URLs
+#   (http://localhost/lgp/<name>), LANGSMITH_PUBLIC_API_ENDPOINT, Fleet URLs.
+#   Those only work if the ingress is reachable on :80, and a port can't be put
+#   in config.hostname because the chart also uses it as the Ingress host rule.
+#   So -ld* forwards on 80 (needs sudo on macOS/Linux); -l stays on 8080.
+#   MINIKUBE_PORT (env or .env) overrides the choice.
+##############################################################################
+resolve_minikube_port() {
+    if [ -n "$MINIKUBE_PORT" ]; then
+        if ! [[ "$MINIKUBE_PORT" =~ ^[0-9]+$ ]] || [ "$MINIKUBE_PORT" -lt 1 ] || [ "$MINIKUBE_PORT" -gt 65535 ]; then
+            log ERROR "Invalid MINIKUBE_PORT '${MINIKUBE_PORT}' (must be 1-65535)"
+            exit 1
+        fi
+    elif [ "$INSTALL_LD" = true ]; then
+        MINIKUBE_PORT=80
+    else
+        MINIKUBE_PORT=8080
+    fi
+}
+
+##############################################################################
+# Function: minikube_endpoint
+# Description: Browser-facing localhost endpoint for a port (omits :80)
+##############################################################################
+minikube_endpoint() {
+    local port="$1"
+    if [ "$port" = "80" ]; then echo "localhost"; else echo "localhost:${port}"; fi
+}
+
+##############################################################################
 # Function: start_minikube_port_forward
 # Description: Starts port-forward to ingress-nginx-controller in background
-#              for Minikube installations where direct IP access doesn't work
+#              for Minikube installations where direct IP access doesn't work.
+#              Ports below 1024 need root, so the forward runs under sudo
+#              (password prompt up front via `sudo -v`).
 # Returns: 0 on success, 1 on failure
 ##############################################################################
 start_minikube_port_forward() {
     local port="${1:-8080}"
-    
+    local pf_pattern="kubectl.*port-forward svc/ingress-nginx-controller -n ingress-nginx ${port}:80\$"
+
     log INFO "Starting port-forward to ingress-nginx-controller on port ${port}..."
-    
+
     # Check if ingress-nginx-controller service exists
     if ! kubectl get svc ingress-nginx-controller -n ingress-nginx &> /dev/null; then
         log WARNING "ingress-nginx-controller service not found in ingress-nginx namespace"
         return 1
     fi
-    
-    # Kill any existing port-forward on the same port
-    pkill -f "kubectl port-forward.*ingress-nginx-controller.*${port}:80" 2>/dev/null || true
-    
-    # Start port-forward in background
-    nohup kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx "${port}:80" > /dev/null 2>&1 &
-    local pf_pid=$!
-    
-    # Wait a moment and verify it started
-    sleep 2
-    if kill -0 "$pf_pid" 2>/dev/null; then
-        log SUCCESS "Port-forward started successfully (PID: ${pf_pid})"
-        log INFO "LangSmith is accessible at http://localhost:${port}"
+
+    local use_sudo=false
+    if [ "$port" -lt 1024 ]; then
+        use_sudo=true
+        log INFO "Port ${port} is privileged - sudo is required for the port-forward (you may be prompted for your password)"
+        if ! sudo -v; then
+            log ERROR "sudo authentication failed - cannot bind port ${port}"
+            return 1
+        fi
+    fi
+
+    # Kill any existing port-forward on the same port (root-owned ones need sudo)
+    pkill -f "$pf_pattern" 2>/dev/null || true
+    if [ "$use_sudo" = true ]; then
+        sudo -n pkill -f "$pf_pattern" 2>/dev/null || true
+    fi
+    sleep 1
+
+    # Start port-forward in background (kubectl binds 127.0.0.1/::1 only)
+    if [ "$use_sudo" = true ]; then
+        # Pin the absolute kubectl path, kubeconfig and context captured as the
+        # current user, so root doesn't fall back to its own (empty) kubeconfig.
+        local kubectl_bin ctx kubeconfig
+        kubectl_bin=$(command -v kubectl)
+        ctx=$(kubectl config current-context)
+        kubeconfig="${KUBECONFIG:-$HOME/.kube/config}"
+        nohup sudo -n env KUBECONFIG="$kubeconfig" "$kubectl_bin" --context "$ctx" \
+            port-forward svc/ingress-nginx-controller -n ingress-nginx "${port}:80" > /dev/null 2>&1 &
+    else
+        nohup kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx "${port}:80" > /dev/null 2>&1 &
+    fi
+
+    # Wait a moment and verify it started. Check by pattern, not `kill -0 $!`:
+    # under sudo, $! is the sudo wrapper and the kubectl child is root-owned.
+    sleep 3
+    local pf_pids
+    pf_pids=$(pgrep -f "$pf_pattern" 2>/dev/null | tr '\n' ' ')
+    if [ -n "$pf_pids" ] && curl -s -o /dev/null --max-time 5 "http://localhost:${port}/"; then
+        log SUCCESS "Port-forward started successfully (PID: ${pf_pids% })"
+        log INFO "LangSmith is accessible at http://$(minikube_endpoint "$port")"
         return 0
     else
-        log ERROR "Failed to start port-forward"
+        log ERROR "Failed to start port-forward on port ${port}"
         return 1
     fi
 }
@@ -345,15 +409,22 @@ stop_minikube_port_forward() {
     
     # Find and kill port-forward processes for ingress-nginx-controller
     local pf_pids
-    pf_pids=$(pgrep -f "kubectl port-forward.*ingress-nginx-controller" 2>/dev/null || echo "")
+    pf_pids=$(pgrep -f "kubectl.*port-forward.*ingress-nginx-controller" 2>/dev/null || echo "")
     
     if [ -n "$pf_pids" ]; then
         log INFO "Stopping port-forward processes: ${pf_pids}"
-        pkill -f "kubectl port-forward.*ingress-nginx-controller" 2>/dev/null || true
+        pkill -f "kubectl.*port-forward.*ingress-nginx-controller" 2>/dev/null || true
         sleep 1
-        
+
+        # Forwards on privileged ports (e.g. :80 for -ld*) run as root
+        if pgrep -f "kubectl.*port-forward.*ingress-nginx-controller" &>/dev/null; then
+            log INFO "Stopping root-owned port-forward (you may be prompted for your sudo password)..."
+            sudo pkill -f "kubectl.*port-forward.*ingress-nginx-controller" 2>/dev/null || true
+            sleep 1
+        fi
+
         # Verify processes were killed
-        if pgrep -f "kubectl port-forward.*ingress-nginx-controller" &>/dev/null; then
+        if pgrep -f "kubectl.*port-forward.*ingress-nginx-controller" &>/dev/null; then
             log WARNING "Some port-forward processes may still be running"
         else
             log SUCCESS "Port-forward processes stopped successfully"
@@ -1723,12 +1794,12 @@ install_langsmith_deployment() {
                 fi
             done
             # The chart bakes http://localhost (no port) into the frontend's public
-            # Fleet URLs; on Minikube the UI is served via port-forward on :8080, so
-            # rewrite them to the port-forward port or Fleet can't reach its servers.
-            if is_minikube_cluster; then
-                fix_fleet_browser_access 8080
+            # Fleet URLs. On Minikube with the default :80 port-forward those are
+            # already correct; with a non-80 MINIKUBE_PORT, rewrite them to that
+            # port or Fleet can't reach its servers.
+            if is_minikube_cluster && [ "$MINIKUBE_PORT" != "80" ]; then
+                fix_fleet_browser_access "$MINIKUBE_PORT"
             fi
-            log INFO "Access the UI with: kubectl port-forward -n ${NAMESPACE} svc/langsmith-frontend 8080:80"
         else
             log SUCCESS "LangSmith upgraded with deployment feature enabled"
         fi
@@ -1842,7 +1913,7 @@ display_langsmith_info() {
     local attempt=0
     local endpoint_pending=false
     local is_minikube=false
-    local minikube_port="8080"
+    local minikube_port="${MINIKUBE_PORT:-8080}"
     
     # Check if running on Minikube
     if is_minikube_cluster; then
@@ -1881,7 +1952,12 @@ display_langsmith_info() {
     if [ "$is_minikube" = true ]; then
         log INFO "Setting up port-forward for Minikube access..."
         if start_minikube_port_forward "$minikube_port"; then
-            endpoint="localhost:${minikube_port}"
+            endpoint=$(minikube_endpoint "$minikube_port")
+        elif [ "$minikube_port" != "8080" ] && start_minikube_port_forward 8080; then
+            log WARNING "Fell back to port 8080. LangSmith Deployment URLs (http://localhost/lgp/...) will NOT be reachable from the browser."
+            log WARNING "To fix, run: sudo kubectl --kubeconfig \"\$HOME/.kube/config\" --context $(kubectl config current-context) port-forward svc/ingress-nginx-controller -n ingress-nginx ${minikube_port}:80"
+            minikube_port=8080
+            endpoint="localhost:8080"
         else
             # Fallback: show the Minikube IP but warn user
             if [ -z "$endpoint" ]; then
@@ -1922,7 +1998,11 @@ display_langsmith_info() {
         echo ""
         echo -e "${YELLOW}⚠️  Minikube Note: Port-forward is running in the background.${NC}"
         echo -e "${YELLOW}    If you restart your terminal, run:${NC}"
-        echo -e "    ${GREEN}kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx ${minikube_port}:80${NC}"
+        if [ "$minikube_port" -lt 1024 ]; then
+            echo -e "    ${GREEN}sudo kubectl --kubeconfig \"\$HOME/.kube/config\" --context $(kubectl config current-context) port-forward svc/ingress-nginx-controller -n ingress-nginx ${minikube_port}:80${NC}"
+        else
+            echo -e "    ${GREEN}kubectl port-forward svc/ingress-nginx-controller -n ingress-nginx ${minikube_port}:80${NC}"
+        fi
     fi
     echo ""
     echo -e "${RED}⚠️  WARNING: Resource Usage Alert${NC}"
@@ -2156,6 +2236,9 @@ main() {
         
         # Load configuration
         load_configuration
+
+        # Pick the Minikube port-forward port (needs INSTALL_LD + .env loaded)
+        resolve_minikube_port
         
         # Setup Helm repository
         setup_helm_repo
